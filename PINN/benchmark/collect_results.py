@@ -32,9 +32,17 @@ MAIN_COLUMNS = [
     "High_Maneuver_RMSE",
     "LastStep_RMSE",
     "FossenResidual_norm",
+    "FossenResidual_eval_mode",
     "TrajectoryAccelNorm",
     "BestValMSE",
     "BestEpoch",
+    "Sample_RMSE_p50",
+    "Sample_RMSE_p95",
+    "Sample_RMSE_p99",
+    "Sample_RMSE_p995",
+    "Sample_RMSE_max",
+    "Trimmed_RMSE_99",
+    "Trimmed_RMSE_995",
     "TestSplit",
 ]
 
@@ -91,6 +99,37 @@ def _load_long_table(cfg: Config, split: str, key: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _load_sample_distribution(cfg: Config, split: str) -> pd.DataFrame:
+    result_dir = PINN_ROOT / "benchmark" / "results"
+    rows: List[Dict[str, object]] = []
+    keys = [
+        "Sample_RMSE_p50",
+        "Sample_RMSE_p95",
+        "Sample_RMSE_p99",
+        "Sample_RMSE_p995",
+        "Sample_RMSE_max",
+        "Trimmed_RMSE_99",
+        "Trimmed_RMSE_995",
+    ]
+    for model_name in MODEL_ORDER:
+        path = result_dir / (
+            f"result_p{cfg.PRED_LEN}_anchor_{cfg.ANCHOR_POS_SOURCE}"
+            f"_deg_{cfg.DEGRADATION_LEVEL}_{model_name}_{split}.json"
+        )
+        if not path.exists():
+            continue
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        metrics = payload.get("metrics", {})
+        row = {
+            "Group": payload.get("Group"),
+            "Model": payload.get("Model"),
+            "ModelName": payload.get("ModelName"),
+        }
+        row.update({key: metrics.get(key) for key in keys})
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def _to_markdown(df: pd.DataFrame) -> str:
     """Render a small GitHub-flavored Markdown table without extra deps."""
     text_df = df.copy()
@@ -137,10 +176,15 @@ def main() -> None:
     anchor_path = out_dir / f"benchmark_anchor_lag_p{cfg.PRED_LEN}.csv"
     anchor_lag.to_csv(anchor_path, index=False, encoding="utf-8-sig")
 
+    sample_dist = _load_sample_distribution(cfg, split)
+    sample_path = out_dir / f"benchmark_sample_distribution_p{cfg.PRED_LEN}.csv"
+    sample_dist.to_csv(sample_path, index=False, encoding="utf-8-sig")
+
     print(f"Wrote {csv_path}")
     print(f"Wrote {md_path}")
     print(f"Wrote {per_step_path}")
     print(f"Wrote {anchor_path}")
+    print(f"Wrote {sample_path}")
 
 
 if __name__ == "__main__":

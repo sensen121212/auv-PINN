@@ -127,6 +127,11 @@ class DataConfig:
         'bilstm',
         'tcn',
         'vanilla_transformer',
+        'vanilla_transformer_ctrlfeat',
+        'pgt_transformer_kin',
+        'pgt_transformer_dyn_tau0',
+        'pgt_transformer_dyn_controlled',
+        'pgt_transformer_phys_controlled',
         'vanilla_transformer_mask',
         'rope_transformer_nomask',
         'rope_transformer_mask_nophysics',
@@ -196,7 +201,10 @@ class DataConfig:
             )
         valid_models = {
             'cv', 'lstm', 'gru', 'bilstm', 'tcn',
-            'vanilla_transformer', 'vanilla_transformer_mask',
+            'vanilla_transformer', 'vanilla_transformer_ctrlfeat',
+            'pgt_transformer_kin', 'pgt_transformer_dyn_tau0',
+            'pgt_transformer_dyn_controlled', 'pgt_transformer_phys_controlled',
+            'vanilla_transformer_mask',
             'rope_transformer_nomask', 'rope_transformer_mask_nophysics',
             'vrt_pinn_tau0', 'vrt_pinn_controlled',
         }

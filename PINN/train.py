@@ -52,6 +52,7 @@ from baselines import (
     create_benchmark_model,
     get_benchmark_spec,
     is_data_driven_model,
+    is_physics_guided_model,
     is_pinn_model,
 )
 from model import (
@@ -83,7 +84,7 @@ def configure_training_file_logging(cfg: Config) -> Path:
     log_dir = cfg.paths.project_root / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     spec = get_benchmark_spec(cfg.MODEL_NAME)
-    if spec.kind == 'pinn':
+    if spec.kind in ('pinn', 'pgt'):
         log_physics_mode = spec.physics_mode
         log_control_mode = spec.control_mode
     else:
@@ -278,7 +279,7 @@ def _uses_controlled_residual(physics_mode: str, control_mode: str) -> bool:
 def _effective_physics_control_modes(cfg: Config, model_name: str) -> Tuple[str, str]:
     """Resolve model-specific physics/control settings for fair benchmarks."""
     spec = get_benchmark_spec(model_name)
-    if spec.kind == 'pinn':
+    if spec.kind in ('pinn', 'pgt'):
         return spec.physics_mode, spec.control_mode
     return 'none', 'none'
 
@@ -392,6 +393,226 @@ def save_data_only_checkpoint(
         'history': history,
         'config': config,
     }, path)
+
+
+def _physics_guided_losses(
+    pred_pos: Tensor,
+    target_pos: Tensor,
+    last_vel: Tensor,
+    last_pos: Tensor,
+    anchor_thrust: Tensor,
+    anchor_attitude: Tensor,
+    kinematic_loss_fn: KinematicPhysicsLoss,
+    dynamics_loss_fn: FossenDynamicsLoss,
+    dt: float,
+    use_kinematic: bool,
+    use_dynamics: bool,
+    control_mode: str,
+    lambda_kin: float,
+    lambda_dyn: float,
+) -> Tuple[Tensor, Dict[str, float]]:
+    """Compute deployment-consistent losses for PG-Transformer variants."""
+    loss_data = _data_loss(pred_pos, target_pos)
+    if use_kinematic:
+        loss_kin = kinematic_loss_fn(
+            pred_pos,
+            last_vel,
+            dt,
+            target_vel=None,
+            last_pos=last_pos,
+        )
+    else:
+        loss_kin = torch.zeros(1, device=pred_pos.device, dtype=pred_pos.dtype)
+
+    if use_dynamics:
+        dyn_attitude = anchor_attitude.unsqueeze(1).expand(-1, pred_pos.shape[1], -1)
+        if control_mode == 'anchor_hold':
+            dyn_thrust = anchor_thrust.unsqueeze(1).expand(-1, pred_pos.shape[1], -1)
+        elif control_mode == 'none':
+            dyn_thrust = None
+        else:
+            raise ValueError(
+                "PG-Transformer main experiments support control_mode "
+                f"'none' or 'anchor_hold', got {control_mode!r}"
+            )
+        loss_dyn = dynamics_loss_fn(
+            pred_pos,
+            last_vel,
+            dt,
+            thrust_data=dyn_thrust,
+            target_vel=None,
+            target_attitude=dyn_attitude,
+            last_pos=last_pos,
+        )
+    else:
+        dyn_thrust = None
+        loss_dyn = torch.zeros(1, device=pred_pos.device, dtype=pred_pos.dtype)
+
+    loss_total = loss_data + lambda_kin * loss_kin + lambda_dyn * loss_dyn
+    residual = getattr(dynamics_loss_fn, 'last_residual_loss', None)
+    prior = getattr(dynamics_loss_fn, 'last_prior_loss', None)
+    log_dict = {
+        'loss_total': float(loss_total.detach().item()),
+        'loss_data_raw': float(loss_data.detach().item()),
+        'loss_physics_raw': float(loss_kin.detach().item()),
+        'loss_dynamics_raw': float(loss_dyn.detach().item()),
+        'loss_dynamics_residual': (
+            float(residual.detach().item()) if residual is not None and use_dynamics else 0.0
+        ),
+        'loss_dynamics_prior': (
+            float(prior.detach().item()) if prior is not None and use_dynamics else 0.0
+        ),
+        'thrust_used': dyn_thrust is not None,
+    }
+    return loss_total, log_dict
+
+
+def train_one_epoch_physics_guided(
+    model: nn.Module,
+    kinematic_loss_fn: KinematicPhysicsLoss,
+    dynamics_loss_fn: FossenDynamicsLoss,
+    loader: DataLoader,
+    optimizer: optim.Optimizer,
+    dt: float,
+    device: torch.device,
+    use_kinematic: bool,
+    use_dynamics: bool,
+    control_mode: str,
+    lambda_kin: float,
+    lambda_dyn: float,
+    grad_clip_norm: float = 5.0,
+) -> Tuple[float, float, float, float, float, float]:
+    """Train one PG-Transformer epoch with explicit weighted physics losses."""
+    model.train()
+    dynamics_loss_fn.train()
+    metrics = EpochMetrics()
+    for batch in loader:
+        (
+            x_seq, validity, target_pos, last_vel, last_pos, anchor_thrust,
+            _target_thrust, _target_vel, _target_body_vel, _target_attitude,
+            _anchor_valid, _anchor_lag, anchor_attitude
+        ) = batch
+        x_seq = x_seq.to(device, non_blocking=True)
+        validity = validity.to(device, non_blocking=True)
+        target_pos = target_pos.to(device, non_blocking=True)
+        last_vel = last_vel.to(device, non_blocking=True)
+        last_pos = last_pos.to(device, non_blocking=True)
+        anchor_thrust = anchor_thrust.to(device, non_blocking=True)
+        anchor_attitude = anchor_attitude.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        pred_pos = _forward_offset_model(model, x_seq, validity, last_pos)
+        if torch.isnan(pred_pos).any():
+            logger.warning("NaN in PG-Transformer output, skipping batch")
+            continue
+        loss_total, log_dict = _physics_guided_losses(
+            pred_pos=pred_pos,
+            target_pos=target_pos,
+            last_vel=last_vel,
+            last_pos=last_pos,
+            anchor_thrust=anchor_thrust,
+            anchor_attitude=anchor_attitude,
+            kinematic_loss_fn=kinematic_loss_fn,
+            dynamics_loss_fn=dynamics_loss_fn,
+            dt=dt,
+            use_kinematic=use_kinematic,
+            use_dynamics=use_dynamics,
+            control_mode=control_mode,
+            lambda_kin=lambda_kin,
+            lambda_dyn=lambda_dyn,
+        )
+        if torch.isnan(loss_total) or torch.isinf(loss_total):
+            logger.warning("NaN/Inf PG-Transformer loss detected, skipping batch")
+            continue
+        loss_total.backward()
+        params = list(model.parameters())
+        if use_dynamics:
+            params += list(dynamics_loss_fn.parameters())
+        torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip_norm)
+        optimizer.step()
+        metrics.update(log_dict)
+    return metrics.average()
+
+
+@torch.no_grad()
+def validate_physics_guided(
+    model: nn.Module,
+    kinematic_loss_fn: KinematicPhysicsLoss,
+    dynamics_loss_fn: FossenDynamicsLoss,
+    loader: DataLoader,
+    dt: float,
+    device: torch.device,
+    use_kinematic: bool,
+    use_dynamics: bool,
+    control_mode: str,
+    lambda_kin: float,
+    lambda_dyn: float,
+) -> Tuple[float, float, float, float, float, float]:
+    """Validate one PG-Transformer epoch with explicit weighted losses."""
+    model.eval()
+    dynamics_loss_fn.eval()
+    metrics = EpochMetrics()
+    for batch in loader:
+        (
+            x_seq, validity, target_pos, last_vel, last_pos, anchor_thrust,
+            _target_thrust, _target_vel, _target_body_vel, _target_attitude,
+            _anchor_valid, _anchor_lag, anchor_attitude
+        ) = batch
+        x_seq = x_seq.to(device, non_blocking=True)
+        validity = validity.to(device, non_blocking=True)
+        target_pos = target_pos.to(device, non_blocking=True)
+        last_vel = last_vel.to(device, non_blocking=True)
+        last_pos = last_pos.to(device, non_blocking=True)
+        anchor_thrust = anchor_thrust.to(device, non_blocking=True)
+        anchor_attitude = anchor_attitude.to(device, non_blocking=True)
+        pred_pos = _forward_offset_model(model, x_seq, validity, last_pos)
+        _, log_dict = _physics_guided_losses(
+            pred_pos=pred_pos,
+            target_pos=target_pos,
+            last_vel=last_vel,
+            last_pos=last_pos,
+            anchor_thrust=anchor_thrust,
+            anchor_attitude=anchor_attitude,
+            kinematic_loss_fn=kinematic_loss_fn,
+            dynamics_loss_fn=dynamics_loss_fn,
+            dt=dt,
+            use_kinematic=use_kinematic,
+            use_dynamics=use_dynamics,
+            control_mode=control_mode,
+            lambda_kin=lambda_kin,
+            lambda_dyn=lambda_dyn,
+        )
+        metrics.update(log_dict)
+    return metrics.average()
+
+
+def save_physics_guided_checkpoint(
+    path: str,
+    epoch: int,
+    model: nn.Module,
+    dynamics_loss_fn: FossenDynamicsLoss,
+    optimizer: optim.Optimizer,
+    scheduler: Any,
+    val_loss: float,
+    history: Dict[str, List[float]],
+    config: Dict[str, Any],
+    use_dynamics: bool,
+) -> None:
+    """Save PG-Transformer checkpoint, including dynamics state when used."""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'val_loss': val_loss,
+        'best_val_mse': val_loss,
+        'history': history,
+        'config': config,
+    }
+    if use_dynamics:
+        checkpoint['dynamics_loss_state_dict'] = dynamics_loss_fn.state_dict()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(checkpoint, path)
 
 
 # =============================================================================
@@ -1179,6 +1400,230 @@ def main() -> None:
                     },
                 )
         logger.info("=" * 88)
+        logger.info("Training Complete!")
+        logger.info(f"  Total time:   {(time.time() - start_time) / 60:.1f} minutes")
+        logger.info(f"  Best val MSE: {best_val:.6f} @ epoch {best_epoch}")
+        logger.info(f"  Best model:   {best_ckpt_path}")
+        return
+
+    if is_physics_guided_model(model_name):
+        best_ckpt_path, last_ckpt_path = _benchmark_checkpoint_paths(cfg, model_name)
+        lambda_kin = float(os.getenv('AUV_LAMBDA_KIN', '0.05'))
+        lambda_dyn = float(os.getenv('AUV_LAMBDA_DYN', '0.01'))
+        use_kinematic = model_spec.use_kinematic_loss
+        use_dynamics = model_spec.use_dynamics_loss
+        logger.info(f"Best checkpoint: {best_ckpt_path}")
+        logger.info(f"Last checkpoint: {last_ckpt_path}")
+        logger.info(f"PGT use kinematic loss: {use_kinematic}")
+        logger.info(f"PGT use dynamics loss: {use_dynamics}")
+        logger.info(f"PGT lambda_kin: {lambda_kin:.6f}")
+        logger.info(f"PGT lambda_dyn: {lambda_dyn:.6f}")
+
+        kinematic_loss_fn, dynamics_loss_fn, _adaptive_unused = create_loss_modules(
+            model_config,
+            vel_scale=pipeline.vel_scale,
+            dt=dt,
+        )
+        dynamics_loss_fn = dynamics_loss_fn.to(device)
+
+        param_groups: List[Dict[str, Any]] = [{
+            'params': model.parameters(),
+            'lr': cfg.LR,
+            'weight_decay': getattr(cfg, 'WEIGHT_DECAY', 1e-4),
+        }]
+        if use_dynamics:
+            param_groups.append({
+                'params': dynamics_loss_fn.parameters(),
+                'lr': cfg.LR * getattr(cfg, 'DYNAMICS_LR_MULTIPLIER', 0.1),
+                'weight_decay': 0.0,
+            })
+        optimizer = optim.AdamW(param_groups)
+
+        scheduler_name = getattr(cfg, 'LR_SCHEDULER', 'plateau')
+        if scheduler_name == 'plateau':
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=getattr(cfg, 'LR_PLATEAU_FACTOR', 0.5),
+                patience=getattr(cfg, 'LR_PLATEAU_PATIENCE', 4),
+                threshold=getattr(cfg, 'MIN_DELTA', 1e-5),
+                threshold_mode='abs',
+                min_lr=getattr(cfg, 'LR_MIN', cfg.LR * 0.01),
+            )
+        elif scheduler_name == 'cosine':
+            scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer,
+                T_0=getattr(cfg, 'LR_T0', 20),
+                T_mult=getattr(cfg, 'LR_TMULT', 2),
+                eta_min=getattr(cfg, 'LR_MIN', cfg.LR * 0.01),
+            )
+        else:
+            scheduler = optim.lr_scheduler.StepLR(
+                optimizer,
+                step_size=getattr(cfg, 'LR_STEP', 80),
+                gamma=getattr(cfg, 'LR_GAMMA', 0.5),
+            )
+
+        history_pgt: Dict[str, List[float]] = {
+            'train_loss': [], 'train_data': [], 'train_kin': [], 'train_dyn': [],
+            'train_dyn_residual': [], 'val_loss': [], 'val_data': [],
+            'val_kin': [], 'val_dyn': [], 'val_dyn_residual': [],
+        }
+        best_val = float('inf')
+        best_epoch = 0
+        patience_counter = 0
+        start_time = time.time()
+        epoch = 0
+        try:
+            logger.info("")
+            logger.info("=" * 118)
+            logger.info(
+                f"{'Epoch':>6} | {'Train':>10} | {'Val MSE':>10} | "
+                f"{'L_data':>10} | {'L_kin':>10} | {'L_dyn':>10} | "
+                f"{'DynRes':>10} | {'LR':>9} | {'Time':>7}"
+            )
+            logger.info("=" * 118)
+            for epoch in range(1, cfg.EPOCHS + 1):
+                epoch_start = time.time()
+                tr_loss, tr_data, tr_kin, tr_dyn, tr_dyn_res, _tr_dyn_prior = (
+                    train_one_epoch_physics_guided(
+                        model=model,
+                        kinematic_loss_fn=kinematic_loss_fn,
+                        dynamics_loss_fn=dynamics_loss_fn,
+                        loader=train_loader,
+                        optimizer=optimizer,
+                        dt=dt,
+                        device=device,
+                        use_kinematic=use_kinematic,
+                        use_dynamics=use_dynamics,
+                        control_mode=effective_control_mode,
+                        lambda_kin=lambda_kin,
+                        lambda_dyn=lambda_dyn,
+                        grad_clip_norm=getattr(cfg, 'GRAD_CLIP', 5.0),
+                    )
+                )
+                val_loss, val_data, val_kin, val_dyn, val_dyn_res, _val_dyn_prior = (
+                    validate_physics_guided(
+                        model=model,
+                        kinematic_loss_fn=kinematic_loss_fn,
+                        dynamics_loss_fn=dynamics_loss_fn,
+                        loader=val_loader,
+                        dt=dt,
+                        device=device,
+                        use_kinematic=use_kinematic,
+                        use_dynamics=use_dynamics,
+                        control_mode=effective_control_mode,
+                        lambda_kin=lambda_kin,
+                        lambda_dyn=lambda_dyn,
+                    )
+                )
+
+                history_pgt['train_loss'].append(tr_loss)
+                history_pgt['train_data'].append(tr_data)
+                history_pgt['train_kin'].append(tr_kin)
+                history_pgt['train_dyn'].append(tr_dyn)
+                history_pgt['train_dyn_residual'].append(tr_dyn_res)
+                history_pgt['val_loss'].append(val_loss)
+                history_pgt['val_data'].append(val_data)
+                history_pgt['val_kin'].append(val_kin)
+                history_pgt['val_dyn'].append(val_dyn)
+                history_pgt['val_dyn_residual'].append(val_dyn_res)
+
+                improved = best_val - val_data > getattr(cfg, 'MIN_DELTA', 1e-5)
+                if improved:
+                    best_val = val_data
+                    best_epoch = epoch
+                    patience_counter = 0
+                    save_physics_guided_checkpoint(
+                        best_ckpt_path,
+                        epoch,
+                        model,
+                        dynamics_loss_fn,
+                        optimizer,
+                        scheduler,
+                        val_data,
+                        history_pgt,
+                        {
+                            'model_name': model_name,
+                            'label': model_spec.label,
+                            'group': model_spec.group,
+                            'pred_len': cfg.PRED_LEN,
+                            'anchor': cfg.ANCHOR_POS_SOURCE,
+                            'degradation': cfg.DEGRADATION_LEVEL,
+                            'stride': cfg.WINDOW_STRIDE,
+                            'params': n_model_params,
+                            'lambda_kin': lambda_kin,
+                            'lambda_dyn': lambda_dyn,
+                            'use_kinematic_loss': use_kinematic,
+                            'use_dynamics_loss': use_dynamics,
+                            'control_mode': effective_control_mode,
+                        },
+                        use_dynamics=use_dynamics,
+                    )
+                else:
+                    patience_counter += 1
+
+                if scheduler_name == 'plateau':
+                    scheduler.step(val_data)
+                else:
+                    scheduler.step()
+
+                should_log = (
+                    epoch == 1
+                    or epoch % getattr(cfg, 'LOG_INTERVAL', 5) == 0
+                    or improved
+                    or (epoch >= getattr(cfg, 'MIN_EPOCHS', 5)
+                        and patience_counter >= getattr(cfg, 'PATIENCE', 12))
+                )
+                if should_log:
+                    logger.info(
+                        f"{epoch:6d} | {tr_loss:10.6f} | {val_data:10.6f} | "
+                        f"{tr_data:10.6f} | {tr_kin:10.6f} | {tr_dyn:10.6f} | "
+                        f"{tr_dyn_res:10.6f} | {optimizer.param_groups[0]['lr']:9.2e} | "
+                        f"{time.time() - epoch_start:6.1f}s"
+                    )
+                    logger.info(
+                        f"       Val split: kin={val_kin:.6f}, dyn={val_dyn:.6f}, "
+                        f"dyn_res={val_dyn_res:.6f} | "
+                        f"best_val_mse={best_val:.6f} @ epoch {best_epoch}, "
+                        f"wait={patience_counter}/{cfg.PATIENCE}"
+                    )
+
+                if epoch >= cfg.MIN_EPOCHS and patience_counter >= cfg.PATIENCE:
+                    logger.info(
+                        f"Early stopping triggered at epoch {epoch}: "
+                        f"best Val MSE {best_val:.6f} was at epoch {best_epoch}."
+                    )
+                    break
+        finally:
+            if epoch > 0:
+                save_physics_guided_checkpoint(
+                    last_ckpt_path,
+                    epoch,
+                    model,
+                    dynamics_loss_fn,
+                    optimizer,
+                    scheduler,
+                    history_pgt['val_data'][-1] if history_pgt['val_data'] else float('inf'),
+                    history_pgt,
+                    {
+                        'model_name': model_name,
+                        'label': model_spec.label,
+                        'group': model_spec.group,
+                        'pred_len': cfg.PRED_LEN,
+                        'anchor': cfg.ANCHOR_POS_SOURCE,
+                        'degradation': cfg.DEGRADATION_LEVEL,
+                        'stride': cfg.WINDOW_STRIDE,
+                        'params': n_model_params,
+                        'lambda_kin': lambda_kin,
+                        'lambda_dyn': lambda_dyn,
+                        'use_kinematic_loss': use_kinematic,
+                        'use_dynamics_loss': use_dynamics,
+                        'control_mode': effective_control_mode,
+                    },
+                    use_dynamics=use_dynamics,
+                )
+        logger.info("=" * 118)
         logger.info("Training Complete!")
         logger.info(f"  Total time:   {(time.time() - start_time) / 60:.1f} minutes")
         logger.info(f"  Best val MSE: {best_val:.6f} @ epoch {best_epoch}")

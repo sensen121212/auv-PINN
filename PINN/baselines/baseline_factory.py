@@ -24,6 +24,8 @@ class BenchmarkModelSpec:
     control_mode: str = "none"
     use_validity_mask: bool = False
     uses_rope: bool = False
+    use_kinematic_loss: bool = False
+    use_dynamics_loss: bool = False
     description: str = ""
 
 
@@ -69,6 +71,53 @@ _SPECS: Dict[str, BenchmarkModelSpec] = {
         group="Generic data-driven baselines",
         trainable=True,
         kind="data",
+    ),
+    "vanilla_transformer_ctrlfeat": BenchmarkModelSpec(
+        name="vanilla_transformer_ctrlfeat",
+        label="Vanilla Transformer + Control Feature",
+        group="Control-aware physics-guided transformers",
+        trainable=True,
+        kind="data",
+    ),
+    "pgt_transformer_kin": BenchmarkModelSpec(
+        name="pgt_transformer_kin",
+        label="PG-Transformer + Kinematic",
+        group="Control-aware physics-guided transformers",
+        trainable=True,
+        kind="pgt",
+        physics_mode="kinematic",
+        use_kinematic_loss=True,
+    ),
+    "pgt_transformer_dyn_tau0": BenchmarkModelSpec(
+        name="pgt_transformer_dyn_tau0",
+        label="PG-Transformer + Tau0 Dynamics",
+        group="Control-aware physics-guided transformers",
+        trainable=True,
+        kind="pgt",
+        physics_mode="inference",
+        control_mode="none",
+        use_dynamics_loss=True,
+    ),
+    "pgt_transformer_dyn_controlled": BenchmarkModelSpec(
+        name="pgt_transformer_dyn_controlled",
+        label="Control-aware PG-Transformer + Dynamics",
+        group="Control-aware physics-guided transformers",
+        trainable=True,
+        kind="pgt",
+        physics_mode="inference",
+        control_mode="anchor_hold",
+        use_dynamics_loss=True,
+    ),
+    "pgt_transformer_phys_controlled": BenchmarkModelSpec(
+        name="pgt_transformer_phys_controlled",
+        label="Control-aware PG-Transformer + Kinematic + Dynamics",
+        group="Control-aware physics-guided transformers",
+        trainable=True,
+        kind="pgt",
+        physics_mode="inference",
+        control_mode="anchor_hold",
+        use_kinematic_loss=True,
+        use_dynamics_loss=True,
     ),
     "vanilla_transformer_mask": BenchmarkModelSpec(
         name="vanilla_transformer_mask",
@@ -140,6 +189,10 @@ def is_data_driven_model(model_name: str) -> bool:
     return get_benchmark_spec(model_name).kind == "data"
 
 
+def is_physics_guided_model(model_name: str) -> bool:
+    return get_benchmark_spec(model_name).kind == "pgt"
+
+
 def create_benchmark_model(model_name: str, config: ModelConfig) -> nn.Module:
     """Create a trainable model for the requested benchmark entry."""
     spec = get_benchmark_spec(model_name)
@@ -186,7 +239,15 @@ def create_benchmark_model(model_name: str, config: ModelConfig) -> nn.Module:
             num_layers=4,
             dropout=config.dropout,
         )
-    if model_name in {"vanilla_transformer", "vanilla_transformer_mask"}:
+    if model_name in {
+        "vanilla_transformer",
+        "vanilla_transformer_ctrlfeat",
+        "pgt_transformer_kin",
+        "pgt_transformer_dyn_tau0",
+        "pgt_transformer_dyn_controlled",
+        "pgt_transformer_phys_controlled",
+        "vanilla_transformer_mask",
+    }:
         return VanillaTransformerOffsetPredictor(
             **kwargs,
             seq_len=config.seq_len,

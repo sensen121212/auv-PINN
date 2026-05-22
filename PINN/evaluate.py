@@ -279,6 +279,7 @@ class InferenceResults:
     input_features: NDArray[np.float32]  # [N, seq_len, F] for maneuver analysis
     anchor_lag: NDArray[np.float32]
     fossen_residual_norm: float = float('nan')
+    fossen_residual_eval_mode: str = 'not_available'
 
 
 def _benchmark_checkpoint_candidates(cfg: Config, model_name: str) -> List[Path]:
@@ -325,7 +326,7 @@ def _find_checkpoint(cfg: Config, model_name: str) -> Optional[Path]:
 def _common_physics_control(model_name: str) -> Tuple[str, str]:
     """Use a controlled inference residual as the default common metric."""
     spec = get_benchmark_spec(model_name)
-    if spec.kind == 'pinn':
+    if spec.kind in ('pinn', 'pgt') and spec.use_dynamics_loss:
         return spec.physics_mode, spec.control_mode
     return 'inference', 'anchor_hold'
 
@@ -411,14 +412,30 @@ def _load_dynamics_evaluator(
     )
     dynamics_loss_fn = dynamics_loss_fn.to(device)
 
-    eval_ckpt_path = _select_physics_eval_checkpoint(
-        cfg, current_ckpt_path, anchor_source, physics_source, control_source
-    )
+    eval_checkpoint: Optional[Dict[str, object]] = None
+    eval_mode = 'not_available'
+    eval_ckpt_path = current_ckpt_path
+    if current_ckpt_path and os.path.exists(current_ckpt_path):
+        maybe_checkpoint = torch.load(current_ckpt_path, map_location=device)
+        if 'dynamics_loss_state_dict' in maybe_checkpoint:
+            eval_checkpoint = maybe_checkpoint
+            eval_mode = 'learned_checkpoint'
+        else:
+            eval_ckpt_path = _select_physics_eval_checkpoint(
+                cfg, current_ckpt_path, anchor_source, physics_source, control_source
+            )
+    else:
+        eval_ckpt_path = _select_physics_eval_checkpoint(
+            cfg, current_ckpt_path, anchor_source, physics_source, control_source
+        )
+
     if not os.path.exists(eval_ckpt_path):
         logger.warning(f"Physics evaluator checkpoint not found: {eval_ckpt_path}")
         return None, None
 
-    eval_checkpoint = torch.load(eval_ckpt_path, map_location=device)
+    if eval_checkpoint is None:
+        eval_checkpoint = torch.load(eval_ckpt_path, map_location=device)
+        eval_mode = 'nominal_evaluator'
     if 'dynamics_loss_state_dict' not in eval_checkpoint:
         logger.warning(
             "Checkpoint has no dynamics_loss_state_dict; "
@@ -427,8 +444,10 @@ def _load_dynamics_evaluator(
         return None, None
 
     dynamics_loss_fn.load_state_dict(eval_checkpoint['dynamics_loss_state_dict'])
+    dynamics_loss_fn.fossen_eval_mode = eval_mode
     dynamics_loss_fn.eval()
     logger.info(f"Loaded dynamics evaluator from: {eval_ckpt_path}")
+    logger.info(f"Fossen residual eval mode: {eval_mode}")
     logger.info(
         f"Physics evaluator: mode={physics_source if physics_source != 'none' else 'inference(eval-only)'} | "
         f"control={control_source} | "
@@ -582,6 +601,10 @@ def run_inference(
         input_features=np.concatenate(features_list, axis=0),
         anchor_lag=np.concatenate(anchor_lag_list, axis=0),
         fossen_residual_norm=float(np.nanmean(fossen_residuals)) if fossen_residuals else float('nan'),
+        fossen_residual_eval_mode=(
+            getattr(dynamics_loss_fn, 'fossen_eval_mode', 'not_available')
+            if dynamics_loss_fn is not None else 'not_available'
+        ),
     )
 
 
@@ -642,6 +665,10 @@ def run_constant_velocity(
         input_features=np.concatenate(features_list, axis=0),
         anchor_lag=np.concatenate(anchor_lag_list, axis=0),
         fossen_residual_norm=float(np.nanmean(fossen_residuals)) if fossen_residuals else float('nan'),
+        fossen_residual_eval_mode=(
+            getattr(dynamics_loss_fn, 'fossen_eval_mode', 'not_available')
+            if dynamics_loss_fn is not None else 'not_available'
+        ),
     )
 
 
@@ -696,6 +723,16 @@ def compute_paper_metrics(results: InferenceResults, dt: float = 0.05) -> Dict[s
     high_rmse, _ = compute_rmse_mae(pred[high_mask], gt[high_mask]) if high_mask.any() else (float('nan'), float('nan'))
 
     trajectory_accel_norm = _trajectory_accel_norm(pred, dt)
+    sample_rmse = np.sqrt(np.nanmean(diff ** 2, axis=(1, 2)))
+
+    def _trimmed_rmse(percentile: float) -> float:
+        if sample_rmse.size == 0:
+            return float('nan')
+        threshold = np.nanpercentile(sample_rmse, percentile)
+        keep = sample_rmse <= threshold
+        if not keep.any():
+            return float('nan')
+        return float(np.sqrt(np.nanmean(diff[keep] ** 2)))
 
     return {
         'RMSE': rmse,
@@ -706,7 +743,15 @@ def compute_paper_metrics(results: InferenceResults, dt: float = 0.05) -> Dict[s
         'Normal_RMSE': normal_rmse,
         'High_Maneuver_RMSE': high_rmse,
         'FossenResidual_norm': results.fossen_residual_norm,
+        'FossenResidual_eval_mode': results.fossen_residual_eval_mode,
         'TrajectoryAccelNorm': trajectory_accel_norm,
+        'Sample_RMSE_p50': float(np.nanpercentile(sample_rmse, 50)),
+        'Sample_RMSE_p95': float(np.nanpercentile(sample_rmse, 95)),
+        'Sample_RMSE_p99': float(np.nanpercentile(sample_rmse, 99)),
+        'Sample_RMSE_p995': float(np.nanpercentile(sample_rmse, 99.5)),
+        'Sample_RMSE_max': float(np.nanmax(sample_rmse)),
+        'Trimmed_RMSE_99': _trimmed_rmse(99.0),
+        'Trimmed_RMSE_995': _trimmed_rmse(99.5),
     }
 
 
@@ -856,6 +901,19 @@ def write_benchmark_result(
         'metrics': metrics,
         'per_step_rmse': {f"step_{i + 1}": float(v) for i, v in enumerate(per_step)},
         'anchor_lag_rmse': {k: float(v) for k, v in anchor_lag_metrics.items()},
+        'sample_distribution': {
+            key: metrics[key]
+            for key in (
+                'Sample_RMSE_p50',
+                'Sample_RMSE_p95',
+                'Sample_RMSE_p99',
+                'Sample_RMSE_p995',
+                'Sample_RMSE_max',
+                'Trimmed_RMSE_99',
+                'Trimmed_RMSE_995',
+            )
+            if key in metrics
+        },
     }
     import json
     result_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')

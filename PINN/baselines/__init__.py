@@ -6,6 +6,7 @@ from .baseline_factory import (
     create_benchmark_model,
     get_benchmark_spec,
     is_data_driven_model,
+    is_physics_guided_model,
     is_pinn_model,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "create_benchmark_model",
     "get_benchmark_spec",
     "is_data_driven_model",
+    "is_physics_guided_model",
     "is_pinn_model",
 ]
