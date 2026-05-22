@@ -1,0 +1,641 @@
+# =============================================================================
+# evaluate.py  —  Robust PINN Evaluation & IEEE-Grade Visualization
+# =============================================================================
+"""
+Production-grade evaluation pipeline for AUV trajectory prediction.
+
+Key Features:
+    1. Region-stratified metrics (Normal vs. Sensor-Degraded zones)
+    2. IEEE T-RO/RA-L compliant visualization with Times New Roman fonts
+    3. Sensor dropout region highlighting via axvspan overlays
+    4. Type-safe implementation with comprehensive error handling
+
+Mathematical Metrics:
+    RMSE = sqrt(mean((pred - gt)²))
+    MAE  = mean(|pred - gt|)
+
+Region Stratification:
+    - Normal Region: validity_ratio > 0.5
+    - Degraded Region: validity_ratio ≤ 0.5
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+import warnings
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib import font_manager
+from mpl_toolkits.mplot3d import Axes3D
+import numpy as np
+from numpy.typing import NDArray
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch import Tensor
+from torch.utils.data import DataLoader
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from config import Config
+from dataset import AUVDataPipeline, DatasetConfig
+from model import (
+    AdaptiveRobustLoss,
+    KinematicPhysicsLoss,
+    ModelConfig,
+    RobustPINN,
+    create_loss_modules,
+    create_model,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-8s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+warnings.filterwarnings('ignore', category=RuntimeWarning, message='Mean of empty slice')
+
+
+# =============================================================================
+# IEEE-Grade Font Configuration
+# =============================================================================
+
+def configure_ieee_fonts() -> None:
+    """Configure matplotlib to use Times New Roman for IEEE compliance.
+
+    Falls back to serif fonts if Times New Roman is unavailable.
+    """
+    try:
+        plt.rcParams['font.family'] = 'serif'
+        plt.rcParams['font.serif'] = ['Times New Roman', 'DejaVu Serif']
+        plt.rcParams['mathtext.fontset'] = 'stix'
+        plt.rcParams['font.size'] = 10
+        plt.rcParams['axes.labelsize'] = 11
+        plt.rcParams['axes.titlesize'] = 12
+        plt.rcParams['xtick.labelsize'] = 10
+        plt.rcParams['ytick.labelsize'] = 10
+        plt.rcParams['legend.fontsize'] = 9
+        plt.rcParams['figure.titlesize'] = 13
+        plt.rcParams['lines.linewidth'] = 1.5
+        plt.rcParams['axes.linewidth'] = 0.8
+        plt.rcParams['grid.linewidth'] = 0.5
+    except Exception as e:
+        logger.warning(f"Font configuration failed: {e}. Using default fonts.")
+
+
+# =============================================================================
+# Baseline Model (Pure Data-Driven LSTM)
+# =============================================================================
+
+class BaselineLSTM(nn.Module):
+    """Baseline BiLSTM model without physics constraints.
+
+    This serves as the data-driven baseline for comparison against
+    the physics-informed Robust PINN.
+
+    Architecture:
+        Input → BiLSTM → MLP Decoder → Position Offsets
+
+    Attributes:
+        pred_len: Prediction horizon length.
+        n_targets: Number of output dimensions (3 for x, y, z).
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        hidden_size: int = 128,
+        num_layers: int = 2,
+        pred_len: int = 5,
+        dropout: float = 0.2
+    ) -> None:
+        super().__init__()
+        self.pred_len = pred_len
+        self.n_targets = 3
+
+        self.bilstm = nn.LSTM(
+            input_size=n_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_size * 2, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, pred_len * self.n_targets)
+        )
+
+    def forward(self, x_seq: Tensor) -> Tensor:
+        """Forward pass.
+
+        Args:
+            x_seq: Input sequence [B, T, F].
+
+        Returns:
+            Position offsets [B, pred_len, 3].
+        """
+        out, _ = self.bilstm(x_seq)
+        flat = self.decoder(out[:, -1, :])
+        return flat.view(-1, self.pred_len, self.n_targets)
+
+
+# =============================================================================
+# Metrics Computation
+# =============================================================================
+
+@dataclass
+class RegionMetrics:
+    """Container for region-stratified evaluation metrics.
+
+    Attributes:
+        rmse: Root Mean Squared Error.
+        mae: Mean Absolute Error.
+        n_samples: Number of samples in this region.
+        region_name: Human-readable region identifier.
+    """
+    rmse: float
+    mae: float
+    n_samples: int
+    region_name: str
+
+    def __repr__(self) -> str:
+        return (f"RegionMetrics(region='{self.region_name}', "
+                f"RMSE={self.rmse:.4f}, MAE={self.mae:.4f}, n={self.n_samples})")
+
+
+def compute_rmse_mae(
+    pred: NDArray[np.float32],
+    gt: NDArray[np.float32],
+    mask: Optional[NDArray[np.bool_]] = None
+) -> Tuple[float, float]:
+    """Compute RMSE and MAE with NaN-safe handling.
+
+    Args:
+        pred: Predicted values, shape [N, ...].
+        gt: Ground truth values, shape [N, ...].
+        mask: Optional boolean mask for valid samples.
+
+    Returns:
+        Tuple of (rmse, mae). Returns (nan, nan) if no valid samples.
+    """
+    valid_mask = ~np.isnan(gt)
+
+    if mask is not None:
+        valid_mask = valid_mask & mask
+
+    if not valid_mask.any():
+        return float('nan'), float('nan')
+
+    diff = pred[valid_mask] - gt[valid_mask]
+    rmse = float(np.sqrt(np.mean(diff ** 2)))
+    mae = float(np.mean(np.abs(diff)))
+
+    return rmse, mae
+
+
+def compute_per_region_metrics(
+    preds: NDArray[np.float32],
+    gts: NDArray[np.float32],
+    validity_masks: NDArray[np.float32]
+) -> Dict[str, RegionMetrics]:
+    """Compute metrics stratified by sensor validity regions.
+
+    Stratification Strategy:
+        - Normal Region: mean(validity_mask) > 0.5
+        - Degraded Region: mean(validity_mask) ≤ 0.5
+
+    Args:
+        preds: Predictions, shape [N, pred_len, 3].
+        gts: Ground truth, shape [N, pred_len, 3].
+        validity_masks: Validity masks, shape [N, seq_len, 1].
+
+    Returns:
+        Dictionary mapping region names to RegionMetrics objects.
+    """
+    n_samples = preds.shape[0]
+
+    validity_ratios = validity_masks.mean(axis=(1, 2))
+
+    normal_mask = validity_ratios > 0.5
+    degraded_mask = validity_ratios <= 0.5
+
+    results = {}
+
+    for region_name, region_mask in [
+        ('Normal Region', normal_mask),
+        ('Degraded Region (Sensor Dropout/Noise)', degraded_mask)
+    ]:
+        if not region_mask.any():
+            results[region_name] = RegionMetrics(
+                rmse=float('nan'),
+                mae=float('nan'),
+                n_samples=0,
+                region_name=region_name
+            )
+            continue
+
+        region_preds = preds[region_mask]
+        region_gts = gts[region_mask]
+
+        rmse, mae = compute_rmse_mae(region_preds, region_gts)
+
+        results[region_name] = RegionMetrics(
+            rmse=rmse,
+            mae=mae,
+            n_samples=int(region_mask.sum()),
+            region_name=region_name
+        )
+
+    return results
+
+
+# =============================================================================
+# Inference Pipeline
+# =============================================================================
+
+@dataclass
+class InferenceResults:
+    """Container for model inference outputs.
+
+    Attributes:
+        predictions: Predicted positions [N, pred_len, 3].
+        ground_truth: Ground truth positions [N, pred_len, 3].
+        confidences: Confidence gate outputs [N, 1].
+        validity_masks: Input validity masks [N, seq_len, 1].
+    """
+    predictions: NDArray[np.float32]
+    ground_truth: NDArray[np.float32]
+    confidences: NDArray[np.float32]
+    validity_masks: NDArray[np.float32]
+
+
+@torch.no_grad()
+def run_inference(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    is_pinn: bool = True
+) -> InferenceResults:
+    """Execute model inference on validation set.
+
+    Args:
+        model: Model to evaluate (RobustPINN or BaselineLSTM).
+        loader: Validation data loader.
+        device: Computation device.
+        is_pinn: Whether model is PINN (requires validity and last_pos).
+
+    Returns:
+        InferenceResults containing predictions and metadata.
+    """
+    model.eval()
+
+    preds_list: List[NDArray] = []
+    gts_list: List[NDArray] = []
+    confs_list: List[NDArray] = []
+    validity_list: List[NDArray] = []
+
+    for batch in loader:
+        x_seq, validity, target_pos, last_vel, last_pos = batch
+
+        x_seq = x_seq.to(device, non_blocking=True)
+        validity = validity.to(device, non_blocking=True)
+        last_pos = last_pos.to(device, non_blocking=True)
+
+        if is_pinn:
+            pred_pos, confidence = model(x_seq, validity, last_pos)
+            confs_list.append(confidence.cpu().numpy())
+        else:
+            pred_offset = model(x_seq)
+            pred_pos = last_pos.unsqueeze(1) + pred_offset
+            confs_list.append(np.ones((x_seq.shape[0], 1), dtype=np.float32))
+
+        preds_list.append(pred_pos.cpu().numpy())
+        gts_list.append(target_pos.cpu().numpy())
+        validity_list.append(validity.cpu().numpy())
+
+    return InferenceResults(
+        predictions=np.concatenate(preds_list, axis=0),
+        ground_truth=np.concatenate(gts_list, axis=0),
+        confidences=np.concatenate(confs_list, axis=0),
+        validity_masks=np.concatenate(validity_list, axis=0)
+    )
+
+
+# =============================================================================
+# IEEE-Grade Visualization
+# =============================================================================
+
+def plot_academic_comparison(
+    pinn_results: InferenceResults,
+    baseline_results: InferenceResults,
+    save_dir: str,
+    dt: float = 0.1
+) -> None:
+    """Generate IEEE-compliant comparison visualization.
+
+    Creates a 2-row figure:
+        - Row 1: 3D trajectory comparison
+        - Row 2: Temporal error evolution with sensor dropout highlighting
+
+    Args:
+        pinn_results: PINN inference results.
+        baseline_results: Baseline inference results.
+        save_dir: Directory to save figures.
+        dt: Time step interval for x-axis scaling.
+    """
+    configure_ieee_fonts()
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    gt = pinn_results.ground_truth[:, 0, :]
+    pinn_pred = pinn_results.predictions[:, 0, :]
+    base_pred = baseline_results.predictions[:, 0, :]
+    validity_ratios = pinn_results.validity_masks.mean(axis=(1, 2))
+
+    n_samples = len(gt)
+    time_axis = np.arange(n_samples) * dt
+
+    fig = plt.figure(figsize=(14, 10))
+
+    ax_3d = fig.add_subplot(2, 1, 1, projection='3d')
+
+    valid_gt_mask = ~np.isnan(gt).any(axis=1)
+    gt_valid = gt[valid_gt_mask]
+
+    ax_3d.plot(gt_valid[:, 0], gt_valid[:, 1], gt_valid[:, 2],
+               color='#2ECC71', linewidth=2.0, label='Ground Truth', zorder=3)
+    ax_3d.plot(base_pred[:, 0], base_pred[:, 1], base_pred[:, 2],
+               color='#E74C3C', linewidth=1.8, linestyle='--',
+               label='Baseline LSTM', alpha=0.8, zorder=2)
+    ax_3d.plot(pinn_pred[:, 0], pinn_pred[:, 1], pinn_pred[:, 2],
+               color='#3498DB', linewidth=2.0, label='Robust PINN', zorder=1)
+
+    ax_3d.set_xlabel('East (m)', labelpad=8)
+    ax_3d.set_ylabel('North (m)', labelpad=8)
+    ax_3d.set_zlabel('Up (m)', labelpad=8)
+    ax_3d.set_title('(a) 3D Trajectory Comparison', pad=10, fontweight='bold')
+    ax_3d.legend(loc='upper left', framealpha=0.95)
+    ax_3d.grid(True, alpha=0.3, linewidth=0.5)
+
+    ax_err = fig.add_subplot(2, 1, 2)
+
+    degraded_mask = validity_ratios <= 0.5
+
+    in_degraded = False
+    start_idx = None
+
+    for i in range(n_samples):
+        if degraded_mask[i] and not in_degraded:
+            start_idx = i
+            in_degraded = True
+        elif not degraded_mask[i] and in_degraded:
+            ax_err.axvspan(time_axis[start_idx], time_axis[i - 1],
+                          color='#95A5A6', alpha=0.3, zorder=0)
+            in_degraded = False
+
+    if in_degraded and start_idx is not None:
+        ax_err.axvspan(time_axis[start_idx], time_axis[-1],
+                      color='#95A5A6', alpha=0.3, zorder=0,
+                      label='Sensor Dropout/Noise Region')
+
+    pinn_error = np.linalg.norm(pinn_pred - gt, axis=1)
+    base_error = np.linalg.norm(base_pred - gt, axis=1)
+
+    ax_err.plot(time_axis, base_error, color='#E74C3C', linewidth=1.8,
+                linestyle='--', label='Baseline LSTM Error', alpha=0.8, zorder=2)
+    ax_err.plot(time_axis, pinn_error, color='#3498DB', linewidth=2.0,
+                label='Robust PINN Error', zorder=3)
+
+    ax_err.set_xlabel('Time (s)')
+    ax_err.set_ylabel('Euclidean Error (m)')
+    ax_err.set_title('(b) Temporal Error Evolution with Sensor Degradation Zones',
+                     pad=10, fontweight='bold')
+    ax_err.legend(loc='upper right', framealpha=0.95)
+    ax_err.grid(True, alpha=0.3, linewidth=0.5)
+    ax_err.set_xlim(time_axis[0], time_axis[-1])
+
+    plt.tight_layout()
+
+    save_path = os.path.join(save_dir, 'ieee_comparison_figure.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+    logger.info(f"IEEE-grade figure saved: {save_path}")
+
+
+def plot_per_step_rmse(
+    pinn_results: InferenceResults,
+    baseline_results: InferenceResults,
+    save_dir: str
+) -> None:
+    """Generate per-step RMSE bar chart.
+
+    Args:
+        pinn_results: PINN inference results.
+        baseline_results: Baseline inference results.
+        save_dir: Directory to save figure.
+    """
+    configure_ieee_fonts()
+
+    pred_len = pinn_results.predictions.shape[1]
+
+    pinn_rmse_per_step = np.zeros(pred_len)
+    base_rmse_per_step = np.zeros(pred_len)
+
+    for step in range(pred_len):
+        pinn_rmse_per_step[step], _ = compute_rmse_mae(
+            pinn_results.predictions[:, step, :],
+            pinn_results.ground_truth[:, step, :]
+        )
+        base_rmse_per_step[step], _ = compute_rmse_mae(
+            baseline_results.predictions[:, step, :],
+            baseline_results.ground_truth[:, step, :]
+        )
+
+    steps = np.arange(1, pred_len + 1)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    bar_width = 0.35
+    ax.bar(steps - bar_width/2, base_rmse_per_step, bar_width,
+           label='Baseline LSTM', color='#E74C3C', alpha=0.8)
+    ax.bar(steps + bar_width/2, pinn_rmse_per_step, bar_width,
+           label='Robust PINN', color='#3498DB', alpha=0.8)
+
+    ax.set_xlabel('Prediction Horizon (step)')
+    ax.set_ylabel('RMSE (m)')
+    ax.set_title('RMSE by Prediction Horizon', fontweight='bold')
+    ax.set_xticks(steps)
+    ax.legend(framealpha=0.95)
+    ax.grid(axis='y', alpha=0.3, linewidth=0.5)
+
+    plt.tight_layout()
+
+    save_path = os.path.join(save_dir, 'rmse_per_step.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+    logger.info(f"Per-step RMSE figure saved: {save_path}")
+
+
+# =============================================================================
+# Main Evaluation Pipeline
+# =============================================================================
+
+def main() -> None:
+    """Main evaluation entry point."""
+    cfg = Config()
+    device = torch.device(cfg.DEVICE if hasattr(cfg, 'DEVICE') else
+                         'cuda' if torch.cuda.is_available() else 'cpu')
+
+    logger.info("=" * 70)
+    logger.info("Robust PINN Evaluation Pipeline")
+    logger.info("=" * 70)
+    logger.info(f"Device: {device}")
+
+    dataset_config = DatasetConfig(
+        seq_len=cfg.SEQ_LEN,
+        pred_len=cfg.PRED_LEN,
+        train_ratio=cfg.TRAIN_RATIO,
+        val_ratio=getattr(cfg, 'VAL_RATIO', 0.15),
+        batch_size=cfg.BATCH_SIZE,
+        feature_cols=tuple(cfg.FEATURE_COLS),
+        target_cols=tuple(cfg.TARGET_COLS),
+        vel_cols=tuple(cfg.VEL_COLS)
+    )
+
+    pipeline = AUVDataPipeline(cfg.GT_PATH, cfg.COR_PATH, dataset_config)
+    _, val_loader, _ = pipeline.get_dataloaders(num_workers=0, pin_memory=False)
+    dt = pipeline.mean_dt
+
+    model_config = ModelConfig(
+        n_features=cfg.N_FEATURES,
+        seq_len=cfg.SEQ_LEN,
+        pred_len=cfg.PRED_LEN,
+        d_model=getattr(cfg, 'D_MODEL', 128),
+        nhead=getattr(cfg, 'NHEAD', 8),
+        num_encoder_layers=getattr(cfg, 'NUM_LAYERS', 4),
+        dropout=cfg.DROPOUT
+    )
+
+    pinn_ckpt_path = os.path.join(cfg.SAVE_DIR, 'best_model.pth')
+    if not os.path.exists(pinn_ckpt_path):
+        logger.error(f"PINN checkpoint not found: {pinn_ckpt_path}")
+        logger.error("Please run train.py first")
+        return
+
+    pinn = create_model(model_config).to(device)
+    checkpoint = torch.load(pinn_ckpt_path, map_location=device)
+    pinn.load_state_dict(checkpoint['model_state_dict'])
+    logger.info("✓ Loaded Robust PINN checkpoint")
+
+    baseline_ckpt_path = os.path.join(cfg.SAVE_DIR, 'best_baseline.pth')
+    if not os.path.exists(baseline_ckpt_path):
+        logger.warning(f"Baseline checkpoint not found: {baseline_ckpt_path}")
+        logger.warning("Skipping baseline comparison")
+        baseline = None
+    else:
+        baseline = BaselineLSTM(
+            n_features=cfg.N_FEATURES,
+            hidden_size=getattr(cfg, 'HIDDEN_SIZE', 128),
+            num_layers=getattr(cfg, 'NUM_LAYERS', 2),
+            pred_len=cfg.PRED_LEN,
+            dropout=cfg.DROPOUT
+        ).to(device)
+        baseline.load_state_dict(
+            torch.load(baseline_ckpt_path, map_location=device)['model_state']
+        )
+        logger.info("✓ Loaded Baseline LSTM checkpoint")
+
+    logger.info("")
+    logger.info("Running inference on validation set...")
+
+    pinn_results = run_inference(pinn, val_loader, device, is_pinn=True)
+
+    if baseline is not None:
+        baseline_results = run_inference(baseline, val_loader, device, is_pinn=False)
+    else:
+        baseline_results = None
+
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("Global Metrics (Validation Set)")
+    logger.info("=" * 70)
+
+    pinn_rmse, pinn_mae = compute_rmse_mae(
+        pinn_results.predictions,
+        pinn_results.ground_truth
+    )
+
+    logger.info(f"Robust PINN:    RMSE = {pinn_rmse:.4f} m,  MAE = {pinn_mae:.4f} m")
+
+    if baseline_results is not None:
+        base_rmse, base_mae = compute_rmse_mae(
+            baseline_results.predictions,
+            baseline_results.ground_truth
+        )
+        logger.info(f"Baseline LSTM:  RMSE = {base_rmse:.4f} m,  MAE = {base_mae:.4f} m")
+
+        if base_rmse > 1e-6:
+            improvement = (base_rmse - pinn_rmse) / base_rmse * 100
+            logger.info(f"RMSE Improvement: {improvement:.1f}%")
+
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("Region-Stratified Metrics")
+    logger.info("=" * 70)
+
+    pinn_region_metrics = compute_per_region_metrics(
+        pinn_results.predictions,
+        pinn_results.ground_truth,
+        pinn_results.validity_masks
+    )
+
+    logger.info("\nRobust PINN:")
+    for region_name, metrics in pinn_region_metrics.items():
+        logger.info(f"  {region_name:40s} | RMSE: {metrics.rmse:7.4f} m | "
+                   f"MAE: {metrics.mae:7.4f} m | n={metrics.n_samples:5d}")
+
+    if baseline_results is not None:
+        base_region_metrics = compute_per_region_metrics(
+            baseline_results.predictions,
+            baseline_results.ground_truth,
+            baseline_results.validity_masks
+        )
+
+        logger.info("\nBaseline LSTM:")
+        for region_name, metrics in base_region_metrics.items():
+            logger.info(f"  {region_name:40s} | RMSE: {metrics.rmse:7.4f} m | "
+                       f"MAE: {metrics.mae:7.4f} m | n={metrics.n_samples:5d}")
+
+    logger.info("")
+    logger.info("Generating IEEE-grade visualizations...")
+
+    if baseline_results is not None:
+        plot_academic_comparison(pinn_results, baseline_results, cfg.FIG_DIR, dt)
+        plot_per_step_rmse(pinn_results, baseline_results, cfg.FIG_DIR)
+    else:
+        logger.warning("Skipping comparison plots (no baseline available)")
+
+    logger.info("")
+    logger.info("Evaluation complete!")
+    logger.info("=" * 70)
+
+
+if __name__ == '__main__':
+    main()

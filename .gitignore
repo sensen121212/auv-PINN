@@ -1,0 +1,50 @@
+# Python cache and local environments
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.vscode/
+
+# Training runs, logs, and generated outputs
+runs/
+logs/
+output/
+outputs/
+result/
+results/
+figures/
+benchmark/results/
+benchmark/*.csv
+benchmark/benchmark_results*.md
+benchmark/benchmark_per_step*.md
+benchmark/benchmark_anchor_lag*.md
+
+# Model checkpoints and exported weights
+checkpoints/
+weights/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.h5
+
+# Datasets, arrays, and serialized training artifacts
+data/
+dataset/
+datasets/
+trajectory_dataset/
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.mat
+*.parquet
+*.feather
+*.pkl
+*.npy
+*.npz
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

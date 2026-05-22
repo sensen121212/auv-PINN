@@ -1,0 +1,258 @@
+# =============================================================================
+# train.py  —  Robust PINN 训练主程序
+# =============================================================================
+# 功能:
+#   1. 加载数据，划分训练/验证集
+#   2. 训练 RobustPINN（记录动态权重变化）
+#   3. Early stopping + 学习率衰减
+#   4. 保存最优模型
+#   5. 绘制训练曲线（Loss + 权重变化图）
+# =============================================================================
+
+import os
+import sys
+import time
+import numpy as np
+import torch
+import torch.optim as optim
+import matplotlib
+matplotlib.use('Agg')          # 无 GUI 环境兼容
+import matplotlib.pyplot as plt
+
+# 将 PINN 目录加入路径
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from config  import Config
+from dataset import get_dataloaders
+from model   import RobustPINN
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+def train_one_epoch(model, loader, optimizer, dt, device):
+    """执行一个 epoch 的训练，返回各项损失的均值"""
+    model.train()
+
+    total_loss = total_data = total_phys = 0.0
+    total_wd   = total_wp   = 0.0
+    n_batches  = 0
+
+    for x_seq, validity, target_pos, last_vel, last_pos in loader:
+        # 搬运到设备
+        x_seq      = x_seq.to(device)       # [B, T, F]
+        validity   = validity.to(device)     # [B, T, 1]
+        target_pos = target_pos.to(device)   # [B, PRED_LEN, 3]
+        last_vel   = last_vel.to(device)     # [B, 3]
+        last_pos   = last_pos.to(device)     # [B, 3]
+
+        optimizer.zero_grad()
+
+        # 前向传播
+        pred_pos, confidence = model(x_seq, validity, last_pos)
+
+        # 计算损失
+        loss, ld, lp, wd, wp = model.compute_loss(
+            pred_pos, target_pos, last_vel, dt, confidence
+        )
+
+        # 反向传播
+        loss.backward()
+        # 梯度裁剪，防止 LSTM 梯度爆炸
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        optimizer.step()
+
+        total_loss += loss.item()
+        total_data += ld
+        total_phys += lp
+        total_wd   += wd
+        total_wp   += wp
+        n_batches  += 1
+
+    n = max(n_batches, 1)
+    return (total_loss/n, total_data/n, total_phys/n,
+            total_wd/n, total_wp/n)
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+@torch.no_grad()
+def validate(model, loader, dt, device):
+    """验证集推断，返回各项损失均值"""
+    model.eval()
+
+    total_loss = total_data = total_phys = 0.0
+    n_batches  = 0
+
+    for x_seq, validity, target_pos, last_vel, last_pos in loader:
+        x_seq      = x_seq.to(device)
+        validity   = validity.to(device)
+        target_pos = target_pos.to(device)
+        last_vel   = last_vel.to(device)
+        last_pos   = last_pos.to(device)
+
+        pred_pos, confidence = model(x_seq, validity, last_pos)
+        loss, ld, lp, _, _ = model.compute_loss(
+            pred_pos, target_pos, last_vel, dt, confidence
+        )
+
+        total_loss += loss.item()
+        total_data += ld
+        total_phys += lp
+        n_batches  += 1
+
+    n = max(n_batches, 1)
+    return total_loss/n, total_data/n, total_phys/n
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+def plot_training_curves(history: dict, save_dir: str):
+    """绘制训练曲线（Loss + 权重动态变化）"""
+    epochs = range(1, len(history['train_loss']) + 1)
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    fig.suptitle('Robust PINN Training Dynamics', fontsize=14, fontweight='bold')
+
+    # -- 总损失 --
+    ax = axes[0, 0]
+    ax.plot(epochs, history['train_loss'], label='Train Total Loss', color='royalblue')
+    ax.plot(epochs, history['val_loss'],   label='Val   Total Loss', color='coral',
+            linestyle='--')
+    ax.set_xlabel('Epoch'); ax.set_ylabel('Loss (MSE)')
+    ax.set_title('Total Loss'); ax.legend(); ax.grid(alpha=0.3)
+
+    # -- 数据损失 vs 物理损失 --
+    ax = axes[0, 1]
+    ax.plot(epochs, history['train_data'],  label='Train Data Loss',    color='steelblue')
+    ax.plot(epochs, history['train_phys'],  label='Train Physics Loss', color='darkorange')
+    ax.set_xlabel('Epoch'); ax.set_ylabel('Loss (MSE)')
+    ax.set_title('Data Loss vs Physics Loss'); ax.legend(); ax.grid(alpha=0.3)
+
+    # -- 动态权重变化（本文核心贡献图！）--
+    ax = axes[1, 0]
+    ax.plot(epochs, history['w_data'],    label='w_data (data weight)',    color='green')
+    ax.plot(epochs, history['w_physics'], label='w_physics (physics weight)', color='red')
+    ax.axhline(y=0.5, color='gray', linestyle=':', linewidth=1)
+    ax.set_xlabel('Epoch'); ax.set_ylabel('Weight Value')
+    ax.set_title('Adaptive Loss Weights (Core Innovation)')
+    ax.legend(); ax.grid(alpha=0.3)
+    ax.set_ylim(bottom=0)
+
+    # -- 验证损失各分项 --
+    ax = axes[1, 1]
+    ax.plot(epochs, history['val_data'],  label='Val Data Loss',    color='steelblue',
+            linestyle='--')
+    ax.plot(epochs, history['val_phys'],  label='Val Physics Loss', color='darkorange',
+            linestyle='--')
+    ax.set_xlabel('Epoch'); ax.set_ylabel('Loss (MSE)')
+    ax.set_title('Validation Loss Breakdown'); ax.legend(); ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    save_path = os.path.join(save_dir, 'training_curves.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"[Plot] 训练曲线已保存: {save_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+def main():
+    cfg    = Config()
+    device = cfg.DEVICE
+    print(f"[Config] 使用设备: {device}")
+
+    # ── 1. 数据 ──
+    train_loader, val_loader, dt, scaler = get_dataloaders(
+        cfg.GT_PATH, cfg.COR_PATH, cfg
+    )
+
+    # ── 2. 模型 ──
+    model = RobustPINN(
+        n_features    = cfg.N_FEATURES,
+        hidden_size   = cfg.HIDDEN_SIZE,
+        num_layers    = cfg.NUM_LAYERS,
+        pred_len      = cfg.PRED_LEN,
+        dropout       = cfg.DROPOUT,
+        w_physics_max = cfg.W_PHYSICS_MAX,
+        w_physics_min = cfg.W_PHYSICS_MIN,
+    ).to(device)
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[Model] 可训练参数量: {n_params:,}")
+
+    # ── 3. 优化器 & 调度器 ──
+    optimizer = optim.Adam(model.parameters(), lr=cfg.LR)
+    scheduler = optim.lr_scheduler.StepLR(
+        optimizer, step_size=cfg.LR_STEP, gamma=cfg.LR_GAMMA
+    )
+
+    # ── 4. 训练循环 ──
+    history = {
+        'train_loss': [], 'train_data': [], 'train_phys': [],
+        'val_loss':   [], 'val_data':   [], 'val_phys':   [],
+        'w_data':     [], 'w_physics':  []
+    }
+
+    best_val_loss = float('inf')
+    patience_cnt  = 0
+    best_ckpt     = os.path.join(cfg.SAVE_DIR, 'best_model.pth')
+
+    print("\n" + "=" * 65)
+    print(f"{'Epoch':>6} {'Train':>9} {'Val':>9} "
+          f"{'L_data':>8} {'L_phys':>8} "
+          f"{'w_data':>7} {'w_phys':>8} {'LR':>9}")
+    print("=" * 65)
+
+    for epoch in range(1, cfg.EPOCHS + 1):
+        t0 = time.time()
+
+        tr_loss, tr_data, tr_phys, wd, wp = train_one_epoch(
+            model, train_loader, optimizer, dt, device
+        )
+        val_loss, val_data, val_phys = validate(
+            model, val_loader, dt, device
+        )
+
+        scheduler.step()
+        lr_now = optimizer.param_groups[0]['lr']
+        elapsed = time.time() - t0
+
+        # 记录历史
+        history['train_loss'].append(tr_loss)
+        history['train_data'].append(tr_data)
+        history['train_phys'].append(tr_phys)
+        history['val_loss'  ].append(val_loss)
+        history['val_data'  ].append(val_data)
+        history['val_phys'  ].append(val_phys)
+        history['w_data'    ].append(wd)
+        history['w_physics' ].append(wp)
+
+        # 打印日志
+        if epoch % 10 == 0 or epoch == 1:
+            print(f"{epoch:>6} {tr_loss:>9.4f} {val_loss:>9.4f} "
+                  f"{tr_data:>8.4f} {tr_phys:>8.4f} "
+                  f"{wd:>7.3f} {wp:>8.3f} {lr_now:>9.2e}  "
+                  f"({elapsed:.1f}s)")
+
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_cnt  = 0
+            torch.save({
+                'epoch':      epoch,
+                'model_state': model.state_dict(),
+                'optimizer':   optimizer.state_dict(),
+                'val_loss':    val_loss,
+                'cfg':         cfg.__dict__,
+            }, best_ckpt)
+        else:
+            patience_cnt += 1
+            if patience_cnt >= cfg.PATIENCE:
+                print(f"\n[EarlyStopping] 验证损失连续 {cfg.PATIENCE} 轮未改善，训练终止。")
+                break
+
+    print("=" * 65)
+    print(f"\n✅ 训练完成！最佳验证损失 = {best_val_loss:.6f}")
+    print(f"   模型已保存至: {best_ckpt}")
+
+    # ── 5. 绘图 ──
+    plot_training_curves(history, cfg.FIG_DIR)
+
+
+if __name__ == '__main__':
+    main()

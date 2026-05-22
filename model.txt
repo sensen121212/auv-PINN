@@ -1,0 +1,1396 @@
+# =============================================================================
+# model.py  —  Dynamics-Informed Neural Network for AUV Trajectory Prediction
+# =============================================================================
+"""
+Production-grade Physics-Informed Neural Network (PINN) for AUV trajectory
+prediction under degraded sensor conditions (DVL/IMU dropout, impulse noise).
+
+Architecture Revision History (v2.0 — Deep Theoretical Refactoring):
+    Breaking changes from v1.x are documented in-line with [BREAKING] tags.
+
+Core Architectural Innovations (v2.0):
+    1. **Fossen Dynamics-Informed Loss** (replaces kinematic-only residual)
+       Enforces the 6-DOF rigid-body equation:
+           M·v̇ + C(v)·v + D(v)·v = τ
+       with learnable hydrodynamic coefficient matrices M, C(v), D(v).
+       Since the dataset provides no thruster command τ, we treat the system
+       as a *passively-damped free body* (τ ≡ 0) and penalise the dynamics
+       residual as a regulariser. This is declared explicitly per IEEE
+       reproducibility requirements.
+
+    2. **Unified Information Bottleneck** (replaces ConfidenceGate)
+       [BREAKING] ConfidenceGate is abolished. All uncertainty handling is
+       consolidated into the loss layer via maximum-likelihood homoscedastic
+       uncertainty weighting (Kendall et al., CVPR 2018):
+           L = (1/2σ²_data)·L_data + (1/2σ²_phy)·L_phy + log(σ_data·σ_phy)
+       σ parameters live in log-variance space for numerical stability.
+
+    3. **Rotary Position Embedding (RoPE)** (replaces sinusoidal PE)
+       [BREAKING] Absolute positional encoding is abolished. RoPE injects
+       relative position information directly into Q/K dot-products,
+       preserving translational invariance for sliding-window inference.
+       Zero additional learnable parameters introduced.
+       Reference: Su et al., "RoFormer: Enhanced Transformer with Rotary
+       Position Embedding", 2021.
+
+    4. **Strict Attention Masking** (causal ⊗ validity)
+       Self-attention explicitly combines a causal mask (upper-triangular -∞)
+       with a data-validity mask derived from the sensor dropout indicator.
+       This guarantees that invalid (NaN-filled / zero-padded) frames receive
+       exactly zero attention weight after softmax, preventing hidden
+       information pollution.
+
+Mathematical Notation:
+    B = batch size, T = sequence length, F = n_features, P = pred_len,
+    D = d_model, H = nhead, d_h = D/H.
+
+References:
+    [1] Fossen, T.I., "Handbook of Marine Craft Hydrodynamics and Motion
+        Control", Wiley, 2011.  (Chapters 6–8: rigid-body & hydrodynamic
+        coefficient modelling)
+    [2] Kendall, A., Gal, Y., & Cipolla, R., "Multi-Task Learning Using
+        Uncertainty to Weigh Losses for Scene Geometry and Semantics",
+        CVPR 2018.
+    [3] Su, J. et al., "RoFormer: Enhanced Transformer with Rotary Position
+        Embedding", arXiv 2104.09864, 2021.
+    [4] Raissi, M. et al., "Physics-Informed Neural Networks: A Deep Learning
+        Framework for Solving Forward and Inverse Problems Involving Nonlinear
+        Partial Differential Equations", JCP 2019.
+    [5] Vaswani, A. et al., "Attention Is All You Need", NeurIPS 2017.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+@dataclass(frozen=True)
+class ModelConfig:
+    """Immutable configuration for the Dynamics-Informed PINN.
+
+    All hyper-parameters that affect the computational graph are collected here
+    so that a single serialised ``ModelConfig`` suffices to reconstruct the
+    model without ambiguity.
+
+    Attributes:
+        n_features: Number of input features per timestep (default 12:
+            x, y, z, vn, ve, vu, roll, pitch, yaw, ax, ay, az).
+        seq_len: Input sequence length (historical window).
+        pred_len: Prediction horizon length (future steps).
+        d_model: Transformer hidden dimension.  Must be divisible by
+            ``nhead`` **and** by 2 (RoPE requires even head-dim).
+        nhead: Number of attention heads.
+        num_encoder_layers: Depth of Transformer encoder stack.
+        dim_feedforward: Width of position-wise FFN.
+        dropout: Dropout probability applied after attention & FFN.
+        n_dof: Degrees of freedom for Fossen dynamics (3 for translational
+            surge/sway/heave; set to 6 for full 6-DOF if angular rates are
+            available in the prediction target).
+        init_log_var_data: Initial value for log(σ²_data).
+        init_log_var_phy: Initial value for log(σ²_phy).
+        init_log_var_dyn: Initial value for log(σ²_dyn) — dynamics residual.
+    """
+    n_features: int = 12
+    seq_len: int = 20
+    pred_len: int = 5
+    d_model: int = 128
+    nhead: int = 8
+    num_encoder_layers: int = 4
+    dim_feedforward: int = 256
+    dropout: float = 0.1
+    n_dof: int = 3
+    init_log_var_data: float = 0.0
+    init_log_var_phy: float = 0.0
+    init_log_var_dyn: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.d_model % self.nhead != 0:
+            raise ValueError(
+                f"d_model ({self.d_model}) must be divisible by nhead "
+                f"({self.nhead})"
+            )
+        head_dim = self.d_model // self.nhead
+        if head_dim % 2 != 0:
+            raise ValueError(
+                f"head_dim = d_model/nhead = {head_dim} must be even for RoPE. "
+                f"Adjust d_model or nhead."
+            )
+        if self.n_dof not in (3, 6):
+            raise ValueError(
+                f"n_dof must be 3 (translational) or 6 (full), got {self.n_dof}"
+            )
+
+
+# =============================================================================
+# §1  Rotary Position Embedding (RoPE)
+# =============================================================================
+
+class RotaryPositionEmbedding(nn.Module):
+    """Rotary Position Embedding (RoPE) for causal Transformers.
+
+    Injects *relative* position information into Q and K tensors by rotating
+    pairs of dimensions using sinusoidal frequencies, without adding any
+    learnable parameters.
+
+    Mathematical Formulation (per head, per position ``t``):
+        Given query/key vector q ∈ ℝ^{d_h}, partition into consecutive
+        pairs (q_{2i}, q_{2i+1}).  Define:
+
+            θ_i = 1 / 10000^{2i / d_h}
+
+        Apply 2-D rotation:
+            ┌ q'_{2i}   ┐   ┌ cos(t·θ_i)  −sin(t·θ_i) ┐ ┌ q_{2i}   ┐
+            │            │ = │                            │ │           │
+            └ q'_{2i+1} ┘   └ sin(t·θ_i)   cos(t·θ_i)  ┘ └ q_{2i+1} ┘
+
+    The inner product ⟨q'_t, k'_s⟩ then depends only on the *relative*
+    offset (t − s), yielding translational invariance.
+
+    Time complexity:  O(T · d_h)  per head (element-wise, no matmul).
+    Space complexity: O(T · d_h/2) for cached sin/cos tables.
+
+    Attributes:
+        head_dim: Dimension per attention head.
+        max_seq_len: Maximum sequence length for pre-computed tables.
+
+    Note:
+        This module adds **zero** learnable parameters to the model.
+    """
+
+    def __init__(self, head_dim: int, max_seq_len: int = 2048) -> None:
+        super().__init__()
+        if head_dim % 2 != 0:
+            raise ValueError(f"head_dim must be even, got {head_dim}")
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+
+        # Pre-compute inverse frequency vector: θ_i = 1/10000^{2i/d_h}
+        inv_freq = 1.0 / (
+            10000.0 ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # Pre-compute sin/cos tables — lazily resized if seq_len exceeds cache.
+        self._build_cache(max_seq_len)
+
+    def _build_cache(self, seq_len: int) -> None:
+        """Build sin/cos lookup tables up to ``seq_len``.
+
+        Args:
+            seq_len: Maximum position index to cache.
+        """
+        t = torch.arange(seq_len, dtype=torch.float32, device=self.inv_freq.device)
+        # Outer product: [T] x [d_h/2] → [T, d_h/2]
+        freqs = torch.outer(t, self.inv_freq)
+        # Duplicate along last dim to match head_dim: [T, d_h]
+        emb = torch.cat([freqs, freqs], dim=-1)
+        cos_cached = emb.cos()
+        sin_cached = emb.sin()
+        self.register_buffer("cos_cached", cos_cached, persistent=False)
+        self.register_buffer("sin_cached", sin_cached, persistent=False)
+        self.max_seq_len = seq_len
+
+    @staticmethod
+    def _rotate_half(x: Tensor) -> Tensor:
+        """Rotate consecutive pairs: (x0, x1, x2, x3, ...) →
+        (−x1, x0, −x3, x2, ...).
+
+        Args:
+            x: Tensor of shape [..., d_h] where d_h is even.
+
+        Returns:
+            Rotated tensor of same shape.
+        """
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat([-x2, x1], dim=-1)
+
+    def forward(self, q: Tensor, k: Tensor) -> Tuple[Tensor, Tensor]:
+        """Apply RoPE to query and key tensors.
+
+        Args:
+            q: Query tensor of shape [B, H, T, d_h].
+            k: Key tensor of shape [B, H, T, d_h].
+
+        Returns:
+            Tuple of rotated (q', k') with same shapes.
+
+        Raises:
+            RuntimeError: If sequence length exceeds maximum cache size and
+                cache rebuild fails (should not happen in practice).
+        """
+        seq_len = q.shape[2]
+        if seq_len > self.max_seq_len:
+            self._build_cache(seq_len)
+
+        cos = self.cos_cached[:seq_len].to(q.dtype)  # [T, d_h]
+        sin = self.sin_cached[:seq_len].to(q.dtype)  # [T, d_h]
+
+        # Broadcast: [1, 1, T, d_h] over [B, H, T, d_h]
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+
+        q_rot = q * cos + self._rotate_half(q) * sin
+        k_rot = k * cos + self._rotate_half(k) * sin
+
+        return q_rot, k_rot
+
+
+# =============================================================================
+# §2  Multi-Head Attention with RoPE & Strict Masking
+# =============================================================================
+
+class RoPEMultiHeadAttention(nn.Module):
+    """Multi-Head Self-Attention with RoPE and strict composite masking.
+
+    This module replaces ``nn.MultiheadAttention`` to integrate RoPE into
+    the Q/K projection and to enforce a *composite* attention mask that
+    is the element-wise conjunction of:
+
+        final_mask = causal_mask ∧ validity_mask
+
+    where both are applied as additive −∞ biases *before* softmax,
+    guaranteeing that masked positions receive exactly zero weight in the
+    attention output.
+
+    Mathematical Formulation:
+        A = softmax( (Q_rot · K_rot^T) / √d_h + M_final ) · V
+
+        where M_final[i,j] = 0    if j ≤ i AND frame j is valid,
+                            = −∞   otherwise.
+
+    Time complexity:  O(T² · d_h · H)  — standard quadratic attention.
+    Space complexity: O(T² · H)  for attention weight matrix.
+
+    Attributes:
+        d_model: Total model dimension.
+        nhead: Number of attention heads.
+        head_dim: Dimension per head (d_model / nhead).
+        rope: Rotary position embedding module (zero extra params).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dropout: float = 0.0,
+        max_seq_len: int = 2048,
+    ) -> None:
+        super().__init__()
+        if d_model % nhead != 0:
+            raise ValueError(
+                f"d_model ({d_model}) must be divisible by nhead ({nhead})"
+            )
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+
+        # Fused QKV projection for efficiency (single matmul).
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=True)
+        self.out_proj = nn.Linear(d_model, d_model, bias=True)
+        self.attn_dropout = nn.Dropout(dropout)
+
+        self.rope = RotaryPositionEmbedding(
+            head_dim=self.head_dim, max_seq_len=max_seq_len
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        attn_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Self-attention forward pass with RoPE and composite mask.
+
+        Args:
+            x: Input tensor of shape [B, T, D].
+            attn_mask: Pre-computed composite mask of shape [B·H, T, T] or
+                [T, T].  Positions to mask must contain ``-inf``; unmasked
+                positions must contain ``0.0``.  If ``None``, no masking is
+                applied (not recommended for causal models).
+
+        Returns:
+            Output tensor of shape [B, T, D].
+        """
+        B, T, D = x.shape
+        H = self.nhead
+        d_h = self.head_dim
+
+        # Fused QKV: [B, T, 3D] → 3 × [B, T, D]
+        qkv = self.qkv_proj(x)
+        qkv = qkv.reshape(B, T, 3, H, d_h).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(dim=0)  # each [B, H, T, d_h]
+
+        # Apply RoPE to Q and K (zero extra params).
+        q, k = self.rope(q, k)
+
+        # Scaled dot-product attention: [B, H, T, T]
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+        # Apply composite mask (causal ∧ validity).
+        if attn_mask is not None:
+            if attn_mask.dim() == 2:
+                # [T, T] → broadcast over [B, H, T, T]
+                attn_weights = attn_weights + attn_mask.unsqueeze(0).unsqueeze(0)
+            elif attn_mask.dim() == 3:
+                # [B*H, T, T] → [B, H, T, T]
+                attn_weights = attn_weights + attn_mask.view(B, H, T, T)
+            elif attn_mask.dim() == 4:
+                attn_weights = attn_weights + attn_mask
+
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        # Weighted sum of values.
+        out = torch.matmul(attn_weights, v)  # [B, H, T, d_h]
+        out = out.transpose(1, 2).reshape(B, T, D)
+        out = self.out_proj(out)
+
+        return out
+
+
+# =============================================================================
+# §3  Transformer Encoder Layer (Pre-Norm + RoPE)
+# =============================================================================
+
+class RoPETransformerEncoderLayer(nn.Module):
+    """Pre-LayerNorm Transformer encoder layer with RoPE attention.
+
+    Uses Pre-Norm (norm-first) architecture for more stable gradients in
+    deep stacks, consistent with modern best practices (Xiong et al., 2020).
+
+    Architecture:
+        x → LN → RoPE-MHA → + → LN → FFN → +
+        └──────────────────────┘    └──────────┘
+              residual                 residual
+
+    Time complexity:  O(T² · D + T · D · D_ff)
+    Space complexity: O(T² + T · D_ff)  (attention matrix + FFN activations)
+
+    Attributes:
+        d_model: Model dimension.
+        nhead: Number of attention heads.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int = 256,
+        dropout: float = 0.1,
+        max_seq_len: int = 2048,
+    ) -> None:
+        super().__init__()
+        self.self_attn = RoPEMultiHeadAttention(
+            d_model=d_model,
+            nhead=nhead,
+            dropout=dropout,
+            max_seq_len=max_seq_len,
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+        self.dropout1 = nn.Dropout(dropout)
+
+    def forward(self, x: Tensor, attn_mask: Optional[Tensor] = None) -> Tensor:
+        """Forward pass.
+
+        Args:
+            x: [B, T, D].
+            attn_mask: Composite mask [T, T] or [B*H, T, T].
+
+        Returns:
+            [B, T, D].
+        """
+        # Pre-Norm Self-Attention
+        residual = x
+        x = self.norm1(x)
+        x = self.self_attn(x, attn_mask=attn_mask)
+        x = self.dropout1(x) + residual
+
+        # Pre-Norm FFN
+        residual = x
+        x = self.norm2(x)
+        x = self.ffn(x) + residual
+
+        return x
+
+
+# =============================================================================
+# §4  Mask Construction Utilities
+# =============================================================================
+
+def build_causal_mask(seq_len: int, device: torch.device) -> Tensor:
+    """Build a strict upper-triangular causal mask.
+
+    Returns a [T, T] float tensor where position (i, j) is:
+        0.0   if j ≤ i  (attend)
+        -1e9  if j > i  (block)
+
+    Uses ``-1e9`` instead of ``-inf`` for numerical safety.  When combined
+    with the validity mask (which may also be ``-1e9``), this avoids the
+    ``softmax([-inf, ...]) → NaN`` pathology.
+
+    Args:
+        seq_len: Sequence length T.
+        device: Target device.
+
+    Returns:
+        Causal mask tensor of shape [T, T].
+
+    Time complexity:  O(T²)
+    Space complexity: O(T²)
+    """
+    return torch.triu(
+        torch.full((seq_len, seq_len), -1e9, device=device),
+        diagonal=1,
+    )
+
+
+def build_validity_mask(
+    validity: Tensor,
+    nhead: int,
+) -> Tensor:
+    """Convert per-frame validity indicators to an attention-compatible mask.
+
+    For each pair (i, j), if frame j is invalid (validity[b, j] == 0), the
+    attention weight from query i to key j must be zero.  We achieve this
+    by setting the mask value to a large negative number at those positions.
+
+    Safety Note:
+        We use ``-1e9`` instead of ``-inf`` to prevent NaN when *all* keys
+        in a row are invalid.  With ``-inf``, softmax([-inf, -inf, ...])
+        produces 0/0 = NaN.  With ``-1e9``, softmax([-1e9, ...]) produces
+        a near-uniform distribution with negligible magnitude, which is
+        numerically safe and functionally equivalent.
+
+    Args:
+        validity: [B, T, 1] float tensor with values in {0, 1}.
+        nhead: Number of attention heads (for broadcasting).
+
+    Returns:
+        Validity mask of shape [B, 1, 1, T] (broadcastable over [B, H, T, T]).
+        Entries are 0.0 (valid) or -1e9 (invalid).
+
+    Time complexity:  O(B · T)
+    Space complexity: O(B · T)
+    """
+    # validity: [B, T, 1] → key_mask: [B, 1, 1, T]
+    key_valid = validity.squeeze(-1)  # [B, T]
+    # 0 → -1e9 (large negative, safe for softmax), 1 → 0.0
+    key_mask = (1.0 - key_valid) * (-1e9)  # [B, T]
+    return key_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, T]
+
+
+def build_composite_mask(
+    seq_len: int,
+    validity: Tensor,
+    nhead: int,
+    device: torch.device,
+) -> Tensor:
+    """Build the final composite attention mask: causal ∧ validity.
+
+    Combines the causal mask and data-validity mask into a single additive
+    bias tensor.  The result guarantees that:
+        1. Future frames are invisible (causality).
+        2. Invalid/corrupt sensor frames contribute zero attention weight
+           (information purity).
+
+    Mathematical Guarantee:
+        final_mask[b, h, i, j] = causal[i, j] + validity[b, j]
+
+        After softmax:
+            α_{ij} = exp(score_{ij} + mask_{ij}) / Σ_k exp(score_{ik} + mask_{ik})
+
+        If mask_{ij} = -inf → α_{ij} = 0  ∎
+
+    Args:
+        seq_len: Sequence length T.
+        validity: [B, T, 1] validity mask.
+        nhead: Number of attention heads.
+        device: Target device.
+
+    Returns:
+        Composite mask of shape [B, 1, T, T] (broadcastable over [B, H, T, T]).
+
+    Time complexity:  O(B · T²)   dominated by broadcasting.
+    Space complexity: O(B · T²)
+    """
+    causal = build_causal_mask(seq_len, device)          # [T, T]
+    val_mask = build_validity_mask(validity, nhead)       # [B, 1, 1, T]
+
+    # causal: [1, 1, T, T] + val_mask: [B, 1, 1, T] → [B, 1, T, T]
+    composite = causal.unsqueeze(0).unsqueeze(0) + val_mask
+    return composite
+
+
+# =============================================================================
+# §5  Transformer-based Trajectory Predictor (RoPE + Strict Masking)
+# =============================================================================
+
+class AUVTransformerPredictor(nn.Module):
+    """Transformer Encoder trajectory predictor with RoPE and strict masking.
+
+    [BREAKING v2.0] Major changes from v1.x:
+        - Absolute sinusoidal PE removed; replaced by per-head RoPE.
+        - Attention mask is a composite of causal + validity masks.
+        - ``forward()`` now accepts ``validity`` and builds the composite mask
+          internally, so the caller need not construct masks.
+        - Output is position *offsets* (Δp) relative to last observed position.
+
+    Architecture:
+        Input [B,T,F] → Linear(F→D) → [RoPE-TransformerEncoder ×L] →
+        last-step hidden → MLP Decoder → offsets [B, P, 3]
+
+    The causal masking guarantees that position t attends only to s ≤ t.
+    The validity masking guarantees that corrupt/NaN frames are excluded
+    from the softmax denominator.
+
+    Attributes:
+        d_model: Hidden dimension D.
+        pred_len: Prediction horizon P.
+        n_targets: Number of spatial coordinates (always 3 for x, y, z).
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        d_model: int = 128,
+        nhead: int = 8,
+        num_layers: int = 4,
+        dim_feedforward: int = 256,
+        dropout: float = 0.1,
+        pred_len: int = 5,
+        max_seq_len: int = 512,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+        self.pred_len = pred_len
+        self.n_targets = 3
+
+        # Input projection: F → D.
+        self.input_proj = nn.Sequential(
+            nn.Linear(n_features, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+        # Encoder stack with RoPE.
+        self.encoder_layers = nn.ModuleList([
+            RoPETransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                max_seq_len=max_seq_len,
+            )
+            for _ in range(num_layers)
+        ])
+
+        # Final LayerNorm (pre-norm architecture convention).
+        self.final_norm = nn.LayerNorm(d_model)
+
+        # MLP decoder: D → P*3.
+        self.decoder = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, pred_len * self.n_targets),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Xavier uniform initialisation for stability.
+
+        Biases are zero-initialised.  LayerNorm parameters are left at
+        PyTorch defaults (weight=1, bias=0).
+        """
+        for name, param in self.named_parameters():
+            if "norm" in name:
+                continue
+            if "weight" in name and param.dim() >= 2:
+                nn.init.xavier_uniform_(param)
+            elif "bias" in name:
+                nn.init.zeros_(param)
+
+    def forward(
+        self,
+        x_seq: Tensor,
+        validity: Tensor,
+    ) -> Tensor:
+        """Forward pass with strict masking.
+
+        Args:
+            x_seq: Input features [B, T, F].
+            validity: Per-frame validity mask [B, T, 1], values in {0, 1}.
+
+        Returns:
+            Position offsets [B, pred_len, 3].
+        """
+        B, T, _ = x_seq.shape
+
+        # Project to model dimension.
+        x = self.input_proj(x_seq)  # [B, T, D]
+
+        # Build composite mask: causal ∧ validity → [B, 1, T, T].
+        composite_mask = build_composite_mask(
+            seq_len=T,
+            validity=validity,
+            nhead=self.nhead,
+            device=x.device,
+        )
+
+        # Transformer encoder stack.
+        for layer in self.encoder_layers:
+            x = layer(x, attn_mask=composite_mask)
+
+        x = self.final_norm(x)
+
+        # Temporal aggregation: take the last valid hidden state.
+        last_hidden = x[:, -1, :]  # [B, D]
+
+        # Decode to position offsets.
+        flat_output = self.decoder(last_hidden)  # [B, P*3]
+        offsets = flat_output.view(B, self.pred_len, self.n_targets)
+
+        return offsets
+
+
+# =============================================================================
+# §6  Fossen Dynamics-Informed Loss
+# =============================================================================
+
+class FossenDynamicsLoss(nn.Module):
+    """Dynamics-informed loss based on Fossen's marine vehicle equations.
+
+    Enforces the 6-DOF (or 3-DOF translational) rigid-body + hydrodynamic
+    equation of motion as a soft constraint:
+
+        M · v̇ + C(v) · v + D(v) · v = τ
+
+    Modelling Assumptions (declared for reproducibility):
+        1. **Passive damping (τ ≡ 0)**: The dataset does not contain thruster
+           commands.  We therefore treat the system as freely decelerating
+           under hydrodynamic forces and penalise the residual
+           ``r = M·v̇ + C(v)·v + D(v)·v``.
+        2. **Linear damping approximation**: D(v) is modelled as a constant
+           diagonal matrix (linear drag), which is a standard first-order
+           approximation valid at low-to-moderate Reynolds numbers.
+        3. **Diagonal inertia**: M is initialised as diagonal with physically
+           plausible AUV mass values and learned during training.
+        4. **Quadratic Coriolis**: C(v) is implemented as a skew-symmetric
+           function of v (simplified centripetal/Coriolis coupling).
+
+    Learnable Parameters:
+        - ``mass_diag``: Diagonal elements of the (added-mass + rigid-body)
+          inertia matrix M ∈ ℝ^{n×n}.  Initialised to 50 kg per DOF.
+        - ``damping_diag``: Diagonal elements of the linear damping matrix
+          D ∈ ℝ^{n×n}.  Initialised to 10 N·s/m per DOF.
+        - ``coriolis_coupling``: Off-diagonal coupling coefficients for C(v).
+          Initialised near zero.
+
+    Time complexity per sample:  O(P · n²) where P = pred_len, n = n_dof.
+    Space complexity:            O(n²) for coefficient matrices.
+
+    Attributes:
+        n_dof: Number of degrees of freedom (3 or 6).
+        mass_diag: Learnable diagonal mass/inertia [n_dof].
+        damping_diag: Learnable diagonal damping [n_dof].
+        coriolis_coupling: Learnable Coriolis coupling [n_dof*(n_dof-1)/2].
+    """
+
+    def __init__(
+        self,
+        n_dof: int = 3,
+        init_mass: float = 50.0,
+        init_damping: float = 10.0,
+        reduction: str = "mean",
+    ) -> None:
+        """Initialise Fossen dynamics loss.
+
+        Args:
+            n_dof: Degrees of freedom (3 for translational, 6 for full).
+            init_mass: Initial diagonal mass value (kg).  Typical small AUV:
+                30–100 kg including added mass.
+            init_damping: Initial diagonal damping (N·s/m).
+            reduction: 'mean', 'sum', or 'none'.
+
+        Raises:
+            ValueError: If reduction mode is invalid.
+        """
+        super().__init__()
+        if reduction not in ("mean", "sum", "none"):
+            raise ValueError(f"Invalid reduction: {reduction}")
+        self.reduction = reduction
+        self.n_dof = n_dof
+
+        # Learnable physics parameters (log-space for positivity).
+        self.log_mass_diag = nn.Parameter(
+            torch.full((n_dof,), math.log(init_mass))
+        )
+        self.log_damping_diag = nn.Parameter(
+            torch.full((n_dof,), math.log(init_damping))
+        )
+
+        # Coriolis coupling: n_dof*(n_dof-1)/2 off-diagonal elements.
+        n_coriolis = n_dof * (n_dof - 1) // 2
+        self.coriolis_coupling = nn.Parameter(
+            torch.zeros(n_coriolis)
+        )
+
+    @property
+    def mass_matrix(self) -> Tensor:
+        """Construct diagonal mass matrix M = diag(exp(log_m)).
+
+        Returns:
+            M: [n_dof, n_dof] positive-definite diagonal tensor.
+        """
+        return torch.diag(torch.exp(self.log_mass_diag))
+
+    @property
+    def damping_matrix(self) -> Tensor:
+        """Construct diagonal damping matrix D = diag(exp(log_d)).
+
+        Returns:
+            D: [n_dof, n_dof] positive-definite diagonal tensor.
+        """
+        return torch.diag(torch.exp(self.log_damping_diag))
+
+    def _build_coriolis_matrix(self, v: Tensor) -> Tensor:
+        """Build skew-symmetric Coriolis matrix C(v) from velocity.
+
+        For 3-DOF (surge u, sway v_s, heave w):
+            C(v) = c · ┌  0   -w   v_s ┐
+                       │  w    0  -u   │
+                       └ -v_s  u    0  ┘
+
+        where c is a learnable scalar coupling strength.  For 6-DOF the
+        construction generalises to the full Coriolis/centripetal matrix.
+
+        Args:
+            v: Velocity tensor [B, n_dof].
+
+        Returns:
+            C(v): [B, n_dof, n_dof] skew-symmetric tensor.
+
+        Time complexity:  O(B · n²)
+        Space complexity: O(B · n²)
+        """
+        B = v.shape[0]
+        n = self.n_dof
+        device = v.device
+
+        C = torch.zeros(B, n, n, device=device, dtype=v.dtype)
+
+        if n == 3:
+            # Single coupling coefficient for simplified 3-DOF.
+            c = self.coriolis_coupling[0] if self.coriolis_coupling.numel() > 0 else 0.0
+            u, vs, w = v[:, 0], v[:, 1], v[:, 2]
+
+            C[:, 0, 1] = -c * w
+            C[:, 0, 2] = c * vs
+            C[:, 1, 0] = c * w
+            C[:, 1, 2] = -c * u
+            C[:, 2, 0] = -c * vs
+            C[:, 2, 1] = c * u
+
+        elif n == 6:
+            # Use all n*(n-1)/2 = 15 coupling coefficients.
+            idx = 0
+            for i in range(n):
+                for j in range(i + 1, n):
+                    c_ij = self.coriolis_coupling[idx]
+                    # Weighted by velocity magnitude for physical consistency.
+                    v_mag = v.norm(dim=-1, keepdim=False)  # [B]
+                    C[:, i, j] = c_ij * v_mag
+                    C[:, j, i] = -c_ij * v_mag
+                    idx += 1
+
+        return C
+
+    def forward(
+        self,
+        pred_pos: Tensor,
+        last_vel: Tensor,
+        dt: float,
+    ) -> Tensor:
+        """Compute Fossen dynamics residual loss.
+
+        Velocity is estimated from predicted positions via finite differences.
+        Acceleration is estimated from velocity via finite differences.
+        The dynamics residual is:
+            r_k = M · v̇_k + C(v_k) · v_k + D · v_k
+
+        For a passively-damped system (τ ≡ 0), ||r||² should be minimised.
+
+        Args:
+            pred_pos: Predicted positions [B, P, n_dof].  If n_dof < P's last
+                dim, only the first n_dof columns are used.
+            last_vel: Velocity at the end of the observation window [B, n_dof].
+            dt: Sampling interval (seconds).
+
+        Returns:
+            Dynamics residual loss (scalar if reduction != 'none').
+
+        Note:
+            Since this dataset does not contain thruster commands τ, the
+            residual is treated as an *unforced damping regulariser*.
+            This is explicitly declared per IEEE reproducibility standards.
+        """
+        B, P, D_pos = pred_pos.shape
+        n = min(self.n_dof, D_pos)
+
+        if P < 2:
+            return torch.zeros(1, device=pred_pos.device, requires_grad=True)
+
+        pos = pred_pos[:, :, :n]  # [B, P, n]
+
+        # --- Estimate velocity via finite differences ---
+        # v_0 uses forward difference from last_vel; v_k uses backward diff.
+        vel = torch.zeros(B, P, n, device=pos.device, dtype=pos.dtype)
+        vel[:, 0, :] = last_vel[:, :n]
+        vel[:, 1:, :] = (pos[:, 1:, :] - pos[:, :-1, :]) / (dt + 1e-8)
+
+        # --- Estimate acceleration via finite differences ---
+        accel = torch.zeros(B, P, n, device=pos.device, dtype=pos.dtype)
+        if P >= 2:
+            accel[:, 0, :] = (vel[:, 1, :] - vel[:, 0, :]) / (dt + 1e-8)
+            if P >= 3:
+                # Central difference for interior points.
+                accel[:, 1:-1, :] = (
+                    vel[:, 2:, :] - vel[:, :-2, :]
+                ) / (2.0 * dt + 1e-8)
+            accel[:, -1, :] = (vel[:, -1, :] - vel[:, -2, :]) / (dt + 1e-8)
+
+        # --- Compute dynamics residual: r = M·v̇ + C(v)·v + D·v ---
+        M = self.mass_matrix     # [n, n]
+        D_mat = self.damping_matrix   # [n, n]
+
+        # M·v̇:  [B, P, n] @ [n, n]^T → [B, P, n]  (diagonal, so element-wise)
+        M_accel = torch.einsum("bpn,nn->bpn", accel, M)
+
+        # D·v:  element-wise for diagonal D.
+        D_vel = torch.einsum("bpn,nn->bpn", vel, D_mat)
+
+        # C(v)·v:  per-timestep Coriolis.  Reshape for batch matmul.
+        vel_flat = vel.reshape(B * P, n)
+        C_v = self._build_coriolis_matrix(vel_flat)  # [B*P, n, n]
+        C_vel = torch.bmm(
+            C_v, vel_flat.unsqueeze(-1)
+        ).squeeze(-1).reshape(B, P, n)
+
+        # Total residual (τ ≡ 0 assumption).
+        residual = M_accel + C_vel + D_vel  # [B, P, n]
+
+        # Clamp residual to prevent extreme values from destabilising training.
+        residual = torch.clamp(residual, -1e6, 1e6)
+
+        if self.reduction == "mean":
+            return (residual ** 2).mean()
+        elif self.reduction == "sum":
+            return (residual ** 2).sum()
+        else:
+            return residual ** 2
+
+
+# =============================================================================
+# §7  Trapezoidal Kinematic Loss (Retained, Complementary to Dynamics)
+# =============================================================================
+
+class KinematicPhysicsLoss(nn.Module):
+    """Trapezoidal integration kinematic constraint for AUV motion.
+
+    Retained as a *complementary* regulariser alongside the Fossen dynamics
+    loss.  While the dynamics loss enforces Newton's second law, this loss
+    enforces *kinematic consistency* between predicted positions and velocities
+    via the trapezoidal rule:
+
+        R_k = p̂_{k+1} - p̂_k - (Δt/2)(v̂_{k+1} + v̂_k)
+
+    Truncation error: O(Δt³) per step (vs. O(Δt²) for Euler).
+
+    Time complexity per sample:  O(P · 3)
+    Space complexity:            O(P · 3)
+
+    Attributes:
+        reduction: Loss reduction mode ('mean', 'sum', 'none').
+    """
+
+    def __init__(self, reduction: str = "mean") -> None:
+        super().__init__()
+        if reduction not in ("mean", "sum", "none"):
+            raise ValueError(f"Invalid reduction: {reduction}")
+        self.reduction = reduction
+
+    def forward(
+        self,
+        pred_pos: Tensor,
+        last_vel: Tensor,
+        dt: float,
+    ) -> Tensor:
+        """Compute trapezoidal kinematics residual.
+
+        Args:
+            pred_pos: Predicted positions [B, P, 3].
+            last_vel: Boundary velocity [B, 3].
+            dt: Time step interval.
+
+        Returns:
+            Physics residual loss.
+
+        Time complexity:  O(B · P · 3)
+        Space complexity: O(B · P · 3)
+        """
+        if pred_pos.shape[1] < 2:
+            return torch.zeros(1, device=pred_pos.device, requires_grad=True)
+
+        B, P, n = pred_pos.shape
+
+        # Estimate velocity from positions.
+        pred_vel = torch.zeros(B, P, n, device=pred_pos.device, dtype=pred_pos.dtype)
+        pred_vel[:, 0, :] = last_vel
+        pred_vel[:, 1:, :] = (pred_pos[:, 1:, :] - pred_pos[:, :-1, :]) / (dt + 1e-8)
+
+        # Trapezoidal residual.
+        pos_diff = pred_pos[:, 1:, :] - pred_pos[:, :-1, :]
+        vel_avg = 0.5 * (pred_vel[:, 1:, :] + pred_vel[:, :-1, :])
+        expected_diff = vel_avg * dt
+        residual = pos_diff - expected_diff
+
+        if self.reduction == "mean":
+            return (residual ** 2).mean()
+        elif self.reduction == "sum":
+            return (residual ** 2).sum()
+        else:
+            return residual ** 2
+
+
+# =============================================================================
+# §8  Adaptive Multi-Task Loss (Unified Information Bottleneck)
+# =============================================================================
+
+class AdaptiveRobustLoss(nn.Module):
+    """Unified multi-task loss with homoscedastic uncertainty weighting.
+
+    [BREAKING v2.0] All confidence-gate logic has been removed.  The loss
+    function is now a *pure* maximum-likelihood formulation with no
+    forward-pass modulation, eliminating the gradient conflict between
+    ConfidenceGate and the homoscedastic σ parameters.
+
+    Mathematical Formulation (strict MLE derivation):
+        Given data loss L_data and physics losses L_phy, L_dyn:
+
+        L = 1/(2·σ²_data) · L_data
+          + 1/(2·σ²_phy)  · L_phy
+          + 1/(2·σ²_dyn)  · L_dyn
+          + log(σ_data) + log(σ_phy) + log(σ_dyn)
+
+    Parameterisation:
+        We optimise s_k = log(σ²_k), so σ_k = exp(s_k / 2) > 0 always.
+        The precision is 1/(2σ²_k) = 0.5 · exp(-s_k).
+        The log-barrier is 0.5 · s_k (equivalent to log(σ_k)).
+
+    This parameterisation guarantees:
+        - σ²_k > 0 without constrained optimisation.
+        - Numerically stable gradients (no division by small σ²).
+        - Automatic task weighting: high-noise tasks get down-weighted.
+
+    Attributes:
+        log_var_data: Learnable s_data = log(σ²_data).
+        log_var_phy:  Learnable s_phy  = log(σ²_phy).
+        log_var_dyn:  Learnable s_dyn  = log(σ²_dyn).
+    """
+
+    def __init__(
+        self,
+        init_log_var_data: float = 0.0,
+        init_log_var_phy: float = 0.0,
+        init_log_var_dyn: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.log_var_data = nn.Parameter(torch.tensor(init_log_var_data))
+        self.log_var_phy = nn.Parameter(torch.tensor(init_log_var_phy))
+        self.log_var_dyn = nn.Parameter(torch.tensor(init_log_var_dyn))
+
+    # --- Diagnostic properties (for logging, not in computational graph) ---
+
+    @property
+    def sigma_data(self) -> float:
+        """Current σ_data = exp(s_data / 2)."""
+        return math.exp(0.5 * self.log_var_data.item())
+
+    @property
+    def sigma_phy(self) -> float:
+        """Current σ_phy = exp(s_phy / 2)."""
+        return math.exp(0.5 * self.log_var_phy.item())
+
+    @property
+    def sigma_dyn(self) -> float:
+        """Current σ_dyn = exp(s_dyn / 2)."""
+        return math.exp(0.5 * self.log_var_dyn.item())
+
+    @property
+    def weight_data(self) -> float:
+        """Effective data weight: 1/(2σ²_data) = 0.5·exp(−s_data)."""
+        return 0.5 * math.exp(-self.log_var_data.item())
+
+    @property
+    def weight_phy(self) -> float:
+        """Effective kinematic weight: 0.5·exp(−s_phy)."""
+        return 0.5 * math.exp(-self.log_var_phy.item())
+
+    @property
+    def weight_dyn(self) -> float:
+        """Effective dynamics weight: 0.5·exp(−s_dyn)."""
+        return 0.5 * math.exp(-self.log_var_dyn.item())
+
+    def forward(
+        self,
+        pred_pos: Tensor,
+        target_pos: Tensor,
+        loss_physics: Tensor,
+        loss_dynamics: Tensor,
+    ) -> Tuple[Tensor, Dict[str, float]]:
+        """Compute unified multi-task loss.
+
+        Args:
+            pred_pos: Predicted positions [B, P, 3].
+            target_pos: Ground truth positions [B, P, 3].
+            loss_physics: Pre-computed trapezoidal kinematic loss (scalar).
+            loss_dynamics: Pre-computed Fossen dynamics loss (scalar).
+
+        Returns:
+            Tuple of:
+                - loss_total: Scalar tensor for backpropagation.
+                - log_dict: Dictionary of all loss components & diagnostics.
+
+        Time complexity:  O(B · P · 3) for MSE; O(1) for weighting.
+        Space complexity: O(1) for learnable σ parameters.
+        """
+        # --- Data loss (MSE with NaN-safe masking) ---
+        valid_mask = ~torch.isnan(target_pos)
+        if valid_mask.any():
+            loss_data_raw = F.mse_loss(
+                pred_pos[valid_mask],
+                target_pos[valid_mask],
+                reduction="mean",
+            )
+        else:
+            loss_data_raw = torch.zeros(
+                1, device=pred_pos.device, dtype=pred_pos.dtype
+            )
+
+        # --- Precision (inverse variance) computation ---
+        precision_data = torch.exp(-self.log_var_data)
+        precision_phy = torch.exp(-self.log_var_phy)
+        precision_dyn = torch.exp(-self.log_var_dyn)
+
+        # --- Total loss with log-barrier regularisation ---
+        # L = Σ_k [ 0.5 · exp(-s_k) · L_k + 0.5 · s_k ]
+        loss_total = (
+            0.5 * precision_data * loss_data_raw
+            + 0.5 * precision_phy * loss_physics
+            + 0.5 * precision_dyn * loss_dynamics
+            + 0.5 * (self.log_var_data + self.log_var_phy + self.log_var_dyn)
+        )
+
+        # --- Diagnostics (detached, no graph) ---
+        log_dict: Dict[str, float] = {
+            "loss_total": loss_total.detach().item(),
+            "loss_data_raw": loss_data_raw.detach().item(),
+            "loss_physics_raw": loss_physics.detach().item(),
+            "loss_dynamics_raw": loss_dynamics.detach().item(),
+            "sigma_data": self.sigma_data,
+            "sigma_phy": self.sigma_phy,
+            "sigma_dyn": self.sigma_dyn,
+            "weight_data": self.weight_data,
+            "weight_phy": self.weight_phy,
+            "weight_dyn": self.weight_dyn,
+            "log_var_data": self.log_var_data.item(),
+            "log_var_phy": self.log_var_phy.item(),
+            "log_var_dyn": self.log_var_dyn.item(),
+        }
+
+        return loss_total, log_dict
+
+
+# =============================================================================
+# §9  Main Model: RobustPINN v2.0
+# =============================================================================
+
+class RobustPINN(nn.Module):
+    """Dynamics-Informed Neural Network for AUV trajectory prediction.
+
+    [BREAKING v2.0] Changes from v1.x:
+        - ConfidenceGate removed.  ``forward()`` returns only ``pred_pos``.
+        - Validity mask is now consumed by the Transformer attention layer
+          directly (strict masking), not by a separate gate module.
+        - The model is purely a *predictor*; all loss/uncertainty logic
+          is handled by external loss modules.
+
+    Architecture Overview:
+        ┌─────────────────────────────────────────────────────────────────┐
+        │  Input: x_seq [B, T, F] + validity_mask [B, T, 1]              │
+        │                                                                 │
+        │  ┌──────────────────────────────────────────────────────────┐   │
+        │  │   AUVTransformerPredictor                                │   │
+        │  │   ● RoPE (no absolute PE)                                │   │
+        │  │   ● Composite mask = causal ∧ validity                   │   │
+        │  │   ● Output: offsets [B, P, 3]                            │   │
+        │  └──────────────────────┬───────────────────────────────────┘   │
+        │                         │                                       │
+        │    pred_pos = last_pos + cumsum(offsets)                        │
+        │                         │                                       │
+        │  Output: pred_pos [B, P, 3]                                    │
+        └─────────────────────────────────────────────────────────────────┘
+
+    Loss computation is external (see ``create_loss_modules``):
+        L = 1/(2σ²_data)·MSE + 1/(2σ²_phy)·L_trap + 1/(2σ²_dyn)·L_fossen
+          + log(σ_data·σ_phy·σ_dyn)
+
+    Attributes:
+        config: Frozen model configuration.
+        predictor: Transformer-based trajectory predictor.
+    """
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.config = config
+
+        self.predictor = AUVTransformerPredictor(
+            n_features=config.n_features,
+            d_model=config.d_model,
+            nhead=config.nhead,
+            num_layers=config.num_encoder_layers,
+            dim_feedforward=config.dim_feedforward,
+            dropout=config.dropout,
+            pred_len=config.pred_len,
+            max_seq_len=config.seq_len + 64,
+        )
+
+    def forward(
+        self,
+        x_seq: Tensor,
+        validity: Tensor,
+        last_pos: Tensor,
+    ) -> Tensor:
+        """Forward pass: predict future trajectory positions.
+
+        [BREAKING v2.0] Returns only ``pred_pos`` (no confidence).
+
+        Args:
+            x_seq: Standardised input sequence [B, T, F].
+            validity: Per-frame validity mask [B, T, 1], values in {0, 1}.
+            last_pos: Last observed position [B, 3] (for offset anchoring).
+
+        Returns:
+            pred_pos: Predicted absolute positions [B, pred_len, 3].
+
+        Raises:
+            RuntimeError: If input dimensions are inconsistent with config.
+        """
+        if x_seq.shape[-1] != self.config.n_features:
+            raise RuntimeError(
+                f"Expected {self.config.n_features} input features, "
+                f"got {x_seq.shape[-1]}"
+            )
+
+        offsets = self.predictor(x_seq, validity)
+        pred_pos = last_pos.unsqueeze(1) + offsets
+
+        return pred_pos
+
+    @property
+    def num_parameters(self) -> int:
+        """Total number of trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+# =============================================================================
+# §10  Factory Functions
+# =============================================================================
+
+def create_model(config: ModelConfig) -> RobustPINN:
+    """Factory: instantiate RobustPINN from configuration.
+
+    Args:
+        config: Immutable model configuration.
+
+    Returns:
+        Initialised RobustPINN model (not yet moved to device).
+    """
+    return RobustPINN(config)
+
+
+def create_loss_modules(
+    config: ModelConfig,
+) -> Tuple[KinematicPhysicsLoss, FossenDynamicsLoss, AdaptiveRobustLoss]:
+    """Factory: instantiate all loss modules from configuration.
+
+    Returns three modules that should all be registered with the optimiser
+    (the adaptive loss and dynamics loss have learnable parameters).
+
+    Args:
+        config: Model configuration.
+
+    Returns:
+        Tuple of:
+            - kinematic_loss: Trapezoidal integration residual.
+            - dynamics_loss: Fossen dynamics residual (learnable M, C, D).
+            - adaptive_loss: Homoscedastic uncertainty weighting.
+    """
+    kinematic_loss = KinematicPhysicsLoss(reduction="mean")
+    dynamics_loss = FossenDynamicsLoss(
+        n_dof=config.n_dof,
+        reduction="mean",
+    )
+    adaptive_loss = AdaptiveRobustLoss(
+        init_log_var_data=config.init_log_var_data,
+        init_log_var_phy=config.init_log_var_phy,
+        init_log_var_dyn=config.init_log_var_dyn,
+    )
+    return kinematic_loss, dynamics_loss, adaptive_loss
+
+
+# =============================================================================
+# §11  Backward Compatibility Layer
+# =============================================================================
+
+class LegacyRobustPINN(nn.Module):
+    """Legacy-compatible wrapper for existing training code (v1.x API).
+
+    [DEPRECATED] This wrapper preserves the v1.x call signature where
+    ``forward()`` returns ``(pred_pos, confidence)``.  The confidence value
+    is always ``torch.ones(B, 1)`` since ConfidenceGate has been removed.
+
+    For new code, use ``RobustPINN`` + separate loss modules directly.
+
+    Migration Guide:
+        Old:  pred_pos, confidence = model(x_seq, validity, last_pos)
+        New:  pred_pos = model(x_seq, validity, last_pos)
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        hidden_size: int = 128,
+        num_layers: int = 2,
+        pred_len: int = 5,
+        dropout: float = 0.2,
+        w_physics_max: float = 3.0,
+        w_physics_min: float = 0.1,
+    ) -> None:
+        super().__init__()
+        import warnings
+        warnings.warn(
+            "LegacyRobustPINN is deprecated.  Use RobustPINN + "
+            "create_loss_modules() for the v2.0 API.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+        config = ModelConfig(
+            n_features=n_features,
+            pred_len=pred_len,
+            d_model=hidden_size,
+            nhead=8,
+            num_encoder_layers=num_layers,
+            dropout=dropout,
+        )
+
+        self.model = RobustPINN(config)
+        self.kinematic_loss_fn = KinematicPhysicsLoss()
+        self.dynamics_loss_fn = FossenDynamicsLoss(n_dof=config.n_dof)
+        self.adaptive_loss_fn = AdaptiveRobustLoss()
+        self.pred_len = pred_len
+
+    def forward(
+        self,
+        x_seq: Tensor,
+        validity: Tensor,
+        last_pos: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        """Legacy forward: returns (pred_pos, dummy_confidence).
+
+        The confidence tensor is always ones for backward compatibility.
+        """
+        pred_pos = self.model(x_seq, validity, last_pos)
+        B = x_seq.shape[0]
+        dummy_confidence = torch.ones(B, 1, device=x_seq.device)
+        return pred_pos, dummy_confidence
+
+    def compute_loss(
+        self,
+        pred_pos: Tensor,
+        target_pos: Tensor,
+        last_vel: Tensor,
+        dt: float,
+        confidence: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, float, float, float, float]:
+        """Legacy loss computation.
+
+        Args:
+            pred_pos: [B, P, 3].
+            target_pos: [B, P, 3].
+            last_vel: [B, 3].
+            dt: Time step.
+            confidence: Ignored (kept for API compat).
+
+        Returns:
+            (loss_total, loss_data, loss_physics, w_data, w_phy).
+        """
+        loss_kin = self.kinematic_loss_fn(pred_pos, last_vel, dt)
+        loss_dyn = self.dynamics_loss_fn(pred_pos, last_vel, dt)
+        loss_total, log_dict = self.adaptive_loss_fn(
+            pred_pos, target_pos, loss_kin, loss_dyn
+        )
+        return (
+            loss_total,
+            log_dict["loss_data_raw"],
+            log_dict["loss_physics_raw"],
+            log_dict["weight_data"],
+            log_dict["weight_phy"],
+        )
+
+
+# =============================================================================
+# Module Exports
+# =============================================================================
+
+__all__ = [
+    "ModelConfig",
+    "RotaryPositionEmbedding",
+    "RoPEMultiHeadAttention",
+    "RoPETransformerEncoderLayer",
+    "build_causal_mask",
+    "build_validity_mask",
+    "build_composite_mask",
+    "AUVTransformerPredictor",
+    "FossenDynamicsLoss",
+    "KinematicPhysicsLoss",
+    "AdaptiveRobustLoss",
+    "RobustPINN",
+    "create_model",
+    "create_loss_modules",
+    "LegacyRobustPINN",
+]

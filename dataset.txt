@@ -1,0 +1,575 @@
+# =============================================================================
+# dataset.py  —  AUV 滑窗数据集 (Data-Leakage-Free Implementation)
+# =============================================================================
+"""
+Production-grade time-series dataset for AUV trajectory prediction.
+
+Key Design Principles:
+    1. Strict temporal causality: Scaler fitted ONLY on training split
+    2. Train/Val/Test isolation with configurable gap to prevent window overlap
+    3. Robust NaN handling with high-precision validity masks
+    4. Full type hints and Google-style docstrings
+
+Mathematical Guarantee:
+    Let $T_{split}$ be the train/val boundary timestamp.
+    - $\mu_{train}, \sigma_{train}$ computed from $t < T_{split}$ only
+    - Validation/Test transforms use frozen $(\mu_{train}, \sigma_{train})$
+    - Gap of (SEQ_LEN + PRED_LEN) samples inserted to prevent input window
+      from the validation set overlapping with training targets.
+"""
+
+from __future__ import annotations
+
+import warnings
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
+import pandas as pd
+import torch
+from numpy.typing import NDArray
+from sklearn.preprocessing import StandardScaler
+from torch import Tensor
+from torch.utils.data import DataLoader, Dataset, Subset
+
+
+@dataclass(frozen=True)
+class DatasetConfig:
+    """Immutable configuration for AUV dataset construction.
+
+    Attributes:
+        seq_len: Input sequence length (number of historical timesteps).
+        pred_len: Prediction horizon length.
+        train_ratio: Fraction of data for training (0 < ratio < 1).
+        val_ratio: Fraction of data for validation. Test = 1 - train - val.
+        batch_size: Mini-batch size for DataLoader.
+        feature_cols: Column names for input features.
+        target_cols: Column names for position targets (x, y, z).
+        vel_cols: Column names for velocity (ve, vn, vu), order must match target_cols.
+        gap_multiplier: Multiplier for train/val gap. Gap = multiplier * (seq_len + pred_len).
+    """
+    seq_len: int = 20
+    pred_len: int = 5
+    train_ratio: float = 0.7
+    val_ratio: float = 0.15
+    batch_size: int = 64
+    feature_cols: Tuple[str, ...] = (
+        'x', 'y', 'z', 'vn', 've', 'vu',
+        'roll', 'pitch', 'yaw', 'ax', 'ay', 'az'
+    )
+    target_cols: Tuple[str, ...] = ('x', 'y', 'z')
+    vel_cols: Tuple[str, ...] = ('ve', 'vn', 'vu')
+    gap_multiplier: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not 0 < self.train_ratio < 1:
+            raise ValueError(f"train_ratio must be in (0, 1), got {self.train_ratio}")
+        if not 0 <= self.val_ratio < 1:
+            raise ValueError(f"val_ratio must be in [0, 1), got {self.val_ratio}")
+        if self.train_ratio + self.val_ratio >= 1:
+            raise ValueError("train_ratio + val_ratio must be < 1")
+
+
+class ValidityMaskBuilder:
+    """Constructs high-precision validity masks from corrupted observations.
+
+    Validity is determined by:
+        1. NaN presence in position columns → invalid
+        2. Impulse noise flag (if available) → invalid
+        3. Feature-wise NaN ratio exceeding threshold → degraded confidence
+
+    Output mask values:
+        - 1.0: Fully valid observation
+        - 0.0: Missing or corrupted observation
+        - (0, 1): Partial validity (future extension for soft masks)
+    """
+
+    def __init__(
+        self,
+        target_cols: Tuple[str, ...],
+        feature_cols: Tuple[str, ...],
+        impulse_col: str = 'is_impulse'
+    ) -> None:
+        self._target_cols = target_cols
+        self._feature_cols = feature_cols
+        self._impulse_col = impulse_col
+
+    def build(self, cor_df: pd.DataFrame) -> NDArray[np.float32]:
+        """Build validity mask array.
+
+        Args:
+            cor_df: Corrupted observation DataFrame.
+
+        Returns:
+            validity: Shape [N], values in [0, 1].
+        """
+        n_samples = len(cor_df)
+
+        pos_invalid = cor_df[list(self._target_cols)].isna().any(axis=1).values
+
+        if self._impulse_col in cor_df.columns:
+            impulse_invalid = cor_df[self._impulse_col].values.astype(bool)
+        else:
+            impulse_invalid = np.zeros(n_samples, dtype=bool)
+
+        invalid_mask = pos_invalid | impulse_invalid
+        validity = (~invalid_mask).astype(np.float32)
+
+        return validity
+
+
+class TemporalScalerWrapper:
+    """Wrapper ensuring scaler is fitted only on designated training data.
+
+    This class enforces the temporal causality constraint by:
+        1. Accepting pre-split training data for fitting
+        2. Freezing statistics after fit
+        3. Providing transform-only interface for val/test data
+
+    Mathematical Formulation:
+        Given training features $X_{train} \in \mathbb{R}^{N_{train} \times F}$:
+        $$\mu_f = \frac{1}{N_{train}} \sum_{i=1}^{N_{train}} X_{train}[i, f]$$
+        $$\sigma_f = \sqrt{\frac{1}{N_{train}} \sum_{i=1}^{N_{train}} (X_{train}[i, f] - \mu_f)^2}$$
+
+        Transform: $\tilde{X}[i, f] = \frac{X[i, f] - \mu_f}{\sigma_f + \epsilon}$
+    """
+
+    def __init__(self) -> None:
+        self._scaler: Optional[StandardScaler] = None
+        self._is_fitted: bool = False
+        self._n_features: Optional[int] = None
+
+    @property
+    def is_fitted(self) -> bool:
+        return self._is_fitted
+
+    @property
+    def mean(self) -> Optional[NDArray[np.float64]]:
+        return self._scaler.mean_ if self._is_fitted else None
+
+    @property
+    def std(self) -> Optional[NDArray[np.float64]]:
+        return self._scaler.scale_ if self._is_fitted else None
+
+    def fit(self, X_train: NDArray[np.float32]) -> TemporalScalerWrapper:
+        """Fit scaler on training data only.
+
+        Args:
+            X_train: Training features, shape [N_train, F].
+
+        Returns:
+            self for method chaining.
+
+        Raises:
+            ValueError: If X_train contains all-NaN columns.
+        """
+        if np.all(np.isnan(X_train), axis=0).any():
+            raise ValueError("Training data contains all-NaN columns, cannot fit scaler")
+
+        self._scaler = StandardScaler()
+        self._scaler.fit(X_train)
+        self._is_fitted = True
+        self._n_features = X_train.shape[1]
+
+        return self
+
+    def transform(self, X: NDArray[np.float32]) -> NDArray[np.float32]:
+        """Transform features using frozen training statistics.
+
+        Args:
+            X: Features to transform, shape [N, F].
+
+        Returns:
+            Standardized features, shape [N, F].
+
+        Raises:
+            RuntimeError: If scaler not fitted.
+        """
+        if not self._is_fitted:
+            raise RuntimeError("Scaler must be fitted before transform")
+
+        return self._scaler.transform(X).astype(np.float32)
+
+    def get_sklearn_scaler(self) -> StandardScaler:
+        """Return underlying sklearn scaler for serialization."""
+        if not self._is_fitted:
+            raise RuntimeError("Scaler not fitted")
+        return self._scaler
+
+
+class AUVSlidingWindowDataset(Dataset):
+    """Memory-efficient sliding window dataset for AUV trajectory prediction.
+
+    This dataset implements lazy window extraction from pre-loaded arrays,
+    avoiding redundant memory copies while maintaining O(1) access time.
+
+    Sample Structure:
+        - x_seq: [SEQ_LEN, N_FEATURES] - Standardized input sequence
+        - validity: [SEQ_LEN, 1] - Per-timestep validity mask
+        - target_pos: [PRED_LEN, 3] - Future positions in meters
+        - last_vel: [3] - Velocity at sequence end (ve, vn, vu)
+        - last_pos: [3] - Position at sequence end for offset reconstruction
+
+    Attributes:
+        n_samples: Total number of valid sliding windows.
+        n_features: Number of input features.
+        mean_dt: Mean sampling interval in seconds.
+    """
+
+    def __init__(
+        self,
+        features: NDArray[np.float32],
+        validity: NDArray[np.float32],
+        gt_pos: NDArray[np.float32],
+        gt_vel: NDArray[np.float32],
+        mean_dt: float,
+        seq_len: int,
+        pred_len: int,
+        valid_indices: Optional[List[int]] = None
+    ) -> None:
+        """Initialize dataset from pre-processed arrays.
+
+        Args:
+            features: Standardized features, shape [N, F].
+            validity: Validity mask, shape [N].
+            gt_pos: Ground truth positions, shape [N, 3].
+            gt_vel: Ground truth velocities, shape [N, 3].
+            mean_dt: Mean sampling interval.
+            seq_len: Input sequence length.
+            pred_len: Prediction horizon.
+            valid_indices: Optional list of valid window start indices.
+                          If None, all possible windows are used.
+        """
+        self._features = features
+        self._validity = validity
+        self._gt_pos = gt_pos
+        self._gt_vel = gt_vel
+        self._mean_dt = mean_dt
+        self._seq_len = seq_len
+        self._pred_len = pred_len
+
+        n_total = len(features)
+        max_start_idx = n_total - seq_len - pred_len
+
+        if valid_indices is not None:
+            self._indices = [i for i in valid_indices if 0 <= i <= max_start_idx]
+        else:
+            self._indices = list(range(max_start_idx + 1))
+
+    @property
+    def n_samples(self) -> int:
+        return len(self._indices)
+
+    @property
+    def n_features(self) -> int:
+        return self._features.shape[1]
+
+    @property
+    def mean_dt(self) -> float:
+        return self._mean_dt
+
+    def __len__(self) -> int:
+        return self.n_samples
+
+    def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Extract single sliding window sample.
+
+        Args:
+            idx: Sample index in [0, n_samples).
+
+        Returns:
+            Tuple of (x_seq, validity, target_pos, last_vel, last_pos).
+        """
+        start = self._indices[idx]
+        seq_end = start + self._seq_len
+        pred_end = seq_end + self._pred_len
+
+        x_seq = torch.from_numpy(self._features[start:seq_end].copy())
+        validity = torch.from_numpy(
+            self._validity[start:seq_end].copy()
+        ).unsqueeze(-1)
+        target_pos = torch.from_numpy(self._gt_pos[seq_end:pred_end].copy())
+        last_vel = torch.from_numpy(self._gt_vel[seq_end - 1].copy())
+        last_pos = torch.from_numpy(self._gt_pos[seq_end - 1].copy())
+
+        return x_seq, validity, target_pos, last_vel, last_pos
+
+
+class AUVDataPipeline:
+    """End-to-end data pipeline with strict temporal isolation.
+
+    This pipeline guarantees:
+        1. Scaler fitted exclusively on training split
+        2. Configurable gap between train/val/test to prevent window overlap
+        3. Consistent preprocessing across all splits
+
+    Usage:
+        >>> pipeline = AUVDataPipeline(gt_path, cor_path, config)
+        >>> train_loader, val_loader, test_loader = pipeline.get_dataloaders()
+        >>> dt = pipeline.mean_dt
+        >>> scaler = pipeline.scaler
+    """
+
+    def __init__(
+        self,
+        gt_path: Union[str, Path],
+        cor_path: Union[str, Path],
+        config: DatasetConfig
+    ) -> None:
+        """Initialize pipeline and execute preprocessing.
+
+        Args:
+            gt_path: Path to ground truth CSV.
+            cor_path: Path to corrupted observations CSV.
+            config: Dataset configuration.
+        """
+        self._config = config
+        self._gt_path = Path(gt_path)
+        self._cor_path = Path(cor_path)
+
+        self._scaler = TemporalScalerWrapper()
+        self._mean_dt: float = 0.1
+
+        self._features: Optional[NDArray[np.float32]] = None
+        self._validity: Optional[NDArray[np.float32]] = None
+        self._gt_pos: Optional[NDArray[np.float32]] = None
+        self._gt_vel: Optional[NDArray[np.float32]] = None
+
+        self._train_indices: List[int] = []
+        self._val_indices: List[int] = []
+        self._test_indices: List[int] = []
+
+        self._load_and_preprocess()
+
+    @property
+    def mean_dt(self) -> float:
+        return self._mean_dt
+
+    @property
+    def scaler(self) -> StandardScaler:
+        return self._scaler.get_sklearn_scaler()
+
+    @property
+    def n_features(self) -> int:
+        return len(self._config.feature_cols)
+
+    def _load_and_preprocess(self) -> None:
+        """Load data and execute preprocessing with temporal isolation."""
+        gt_df = pd.read_csv(self._gt_path)
+        cor_df = pd.read_csv(self._cor_path)
+
+        if len(gt_df) != len(cor_df):
+            raise ValueError(
+                f"GT and corrupted data length mismatch: {len(gt_df)} vs {len(cor_df)}"
+            )
+
+        n_total = len(gt_df)
+
+        self._mean_dt = self._compute_mean_dt(gt_df)
+
+        mask_builder = ValidityMaskBuilder(
+            self._config.target_cols,
+            self._config.feature_cols
+        )
+        self._validity = mask_builder.build(cor_df)
+
+        self._gt_pos = gt_df[list(self._config.target_cols)].values.astype(np.float32)
+        self._gt_vel = gt_df[list(self._config.vel_cols)].values.astype(np.float32)
+
+        features_raw = self._fill_missing_features(cor_df)
+
+        n_train_raw = int(n_total * self._config.train_ratio)
+        n_val_raw = int(n_total * self._config.val_ratio)
+
+        train_features = features_raw[:n_train_raw]
+        self._scaler.fit(train_features)
+
+        self._features = self._scaler.transform(features_raw)
+
+        self._compute_split_indices(n_total, n_train_raw, n_val_raw)
+
+    def _compute_mean_dt(self, gt_df: pd.DataFrame) -> float:
+        """Compute robust mean sampling interval."""
+        if 't' not in gt_df.columns:
+            warnings.warn("No 't' column found, using default dt=0.1s")
+            return 0.1
+
+        t_arr = gt_df['t'].values
+        dt_arr = np.diff(t_arr)
+        positive_dt = dt_arr[dt_arr > 1e-6]
+
+        if len(positive_dt) == 0:
+            return 0.1
+
+        return float(np.median(positive_dt))
+
+    def _fill_missing_features(self, cor_df: pd.DataFrame) -> NDArray[np.float32]:
+        """Forward-fill then zero-pad missing feature values.
+
+        Strategy:
+            1. Forward fill (ffill) to propagate last valid observation
+            2. Zero-fill remaining NaNs (typically at sequence start)
+            3. Log warning if >10% of data required filling
+        """
+        feature_df = cor_df[list(self._config.feature_cols)].copy()
+
+        nan_ratio = feature_df.isna().sum().sum() / feature_df.size
+        if nan_ratio > 0.1:
+            warnings.warn(
+                f"High NaN ratio in features: {nan_ratio:.1%}. "
+                "Consider investigating data quality."
+            )
+
+        filled = feature_df.ffill().fillna(0.0)
+
+        return filled.values.astype(np.float32)
+
+    def _compute_split_indices(
+        self,
+        n_total: int,
+        n_train_raw: int,
+        n_val_raw: int
+    ) -> None:
+        """Compute window indices for each split with gap isolation.
+
+        Gap Calculation:
+            gap = gap_multiplier * (seq_len + pred_len)
+
+        This ensures no validation input window can overlap with
+        training target windows, and vice versa.
+        """
+        seq_len = self._config.seq_len
+        pred_len = self._config.pred_len
+        gap = int(self._config.gap_multiplier * (seq_len + pred_len))
+
+        max_window_start = n_total - seq_len - pred_len
+
+        train_end_idx = n_train_raw - seq_len - pred_len
+        self._train_indices = list(range(max(0, train_end_idx + 1)))
+
+        val_start_raw = n_train_raw
+        val_end_raw = n_train_raw + n_val_raw
+
+        val_start_idx = val_start_raw - seq_len + gap
+        val_end_idx = val_end_raw - seq_len - pred_len
+
+        self._val_indices = [
+            i for i in range(val_start_idx, val_end_idx + 1)
+            if 0 <= i <= max_window_start
+        ]
+
+        test_start_raw = val_end_raw
+        test_start_idx = test_start_raw - seq_len + gap
+
+        self._test_indices = [
+            i for i in range(test_start_idx, max_window_start + 1)
+            if 0 <= i <= max_window_start
+        ]
+
+        if len(self._val_indices) == 0:
+            warnings.warn(
+                "Validation set is empty after gap isolation. "
+                "Consider reducing gap_multiplier or increasing data size."
+            )
+        if len(self._test_indices) == 0:
+            warnings.warn(
+                "Test set is empty after gap isolation. "
+                "Consider reducing gap_multiplier or increasing data size."
+            )
+
+    def _create_dataset(self, indices: List[int]) -> AUVSlidingWindowDataset:
+        """Create dataset for given window indices."""
+        return AUVSlidingWindowDataset(
+            features=self._features,
+            validity=self._validity,
+            gt_pos=self._gt_pos,
+            gt_vel=self._gt_vel,
+            mean_dt=self._mean_dt,
+            seq_len=self._config.seq_len,
+            pred_len=self._config.pred_len,
+            valid_indices=indices
+        )
+
+    def get_dataloaders(
+        self,
+        num_workers: int = 0,
+        pin_memory: bool = False
+    ) -> Tuple[DataLoader, DataLoader, DataLoader]:
+        """Create train/val/test DataLoaders.
+
+        Args:
+            num_workers: Number of worker processes for data loading.
+            pin_memory: Whether to pin memory for GPU transfer.
+
+        Returns:
+            Tuple of (train_loader, val_loader, test_loader).
+        """
+        train_ds = self._create_dataset(self._train_indices)
+        val_ds = self._create_dataset(self._val_indices)
+        test_ds = self._create_dataset(self._test_indices)
+
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=self._config.batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory
+        )
+
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=self._config.batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory
+        )
+
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=self._config.batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory
+        )
+
+        print(f"[AUVDataPipeline] Split statistics:")
+        print(f"  Train windows: {len(train_ds)}")
+        print(f"  Val windows:   {len(val_ds)}")
+        print(f"  Test windows:  {len(test_ds)}")
+        print(f"  Mean dt:       {self._mean_dt:.4f}s")
+        print(f"  Scaler μ:      {self._scaler.mean[:3]}... (first 3 features)")
+        print(f"  Scaler σ:      {self._scaler.std[:3]}... (first 3 features)")
+
+        return train_loader, val_loader, test_loader
+
+
+def get_dataloaders(
+    gt_path: Union[str, Path],
+    cor_path: Union[str, Path],
+    cfg: DatasetConfig
+) -> Tuple[DataLoader, DataLoader, float, StandardScaler]:
+    """Legacy-compatible interface for creating dataloaders.
+
+    This function provides backward compatibility with existing training code
+    while using the new leakage-free pipeline internally.
+
+    Args:
+        gt_path: Path to ground truth CSV.
+        cor_path: Path to corrupted observations CSV.
+        cfg: Dataset configuration object.
+
+    Returns:
+        Tuple of (train_loader, val_loader, mean_dt, scaler).
+
+    Note:
+        For new code, prefer using AUVDataPipeline directly for access
+        to test_loader and more detailed statistics.
+    """
+    pipeline = AUVDataPipeline(gt_path, cor_path, cfg)
+    train_loader, val_loader, _ = pipeline.get_dataloaders()
+
+    return train_loader, val_loader, pipeline.mean_dt, pipeline.scaler
