@@ -5,43 +5,35 @@ __pycache__/
 venv/
 .env
 .vscode/
-.idea/
 
-# Preserve old dataset repository metadata locally; never commit it.
-.git.dataset-backup*/
-
-# Logs, runs, and generated outputs
-logs/
-log/
+# Training runs, logs, and generated outputs
 runs/
+logs/
 output/
 outputs/
 result/
 results/
 figures/
-tmp/
-temp/
-cache/
+benchmark/results/
+benchmark/*.csv
+benchmark/benchmark_results*.md
+benchmark/benchmark_per_step*.md
+benchmark/benchmark_anchor_lag*.md
 
 # Model checkpoints and exported weights
 checkpoints/
 weights/
-models/
-saved_models/
 *.pt
 *.pth
 *.ckpt
 *.onnx
 *.h5
 
-# Datasets, arrays, serialized artifacts, and archives
+# Datasets, arrays, and serialized training artifacts
 data/
 dataset/
 datasets/
 trajectory_dataset/
-20210428/
-20220625/
-20220822/
 *.csv
 *.tsv
 *.xlsx
@@ -52,12 +44,6 @@ trajectory_dataset/
 *.pkl
 *.npy
 *.npz
-*.zip
-*.rar
-*.7z
-*.tar
-*.tar.gz
-*.log
 
 # OS/editor noise
 .DS_Store
